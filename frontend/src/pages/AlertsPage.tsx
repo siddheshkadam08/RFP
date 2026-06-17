@@ -19,7 +19,7 @@ const AlertsPage = () => {
       setError('');
 
       try {
-        const response = await get<Alert[]>('/alerts');
+        const response = await get<Alert[]>('/alerts/');
         setAlerts(response);
       } catch (loadError) {
         setError(getApiErrorMessage(loadError, 'Unable to load alerts.'));

@@ -28,7 +28,7 @@ const SourcesPage = () => {
       setError('');
 
       try {
-        const response = await get<Source[]>('/sources');
+        const response = await get<Source[]>('/sources/');
         setSources(response);
       } catch (loadError) {
         setError(getApiErrorMessage(loadError, 'Unable to load sources.'));
@@ -73,7 +73,7 @@ const SourcesPage = () => {
         const updated = await patch<Source>(`/sources/${editingSource.id}`, formValues);
         setSources((current) => current.map((source) => (source.id === updated.id ? updated : source)));
       } else {
-        const created = await post<Source>('/sources', formValues);
+        const created = await post<Source>('/sources/', formValues);
         setSources((current) => [created, ...current]);
       }
 

@@ -51,7 +51,7 @@ const CopilotPage = () => {
     setError('');
 
     try {
-      const response = await post<ChatResponse>('/copilot/chat', {
+      const response = await post<ChatResponse>('/ai/chat', {
         session_id: sessionId,
         message: message.trim(),
       });

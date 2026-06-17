@@ -30,8 +30,8 @@ const AdminPage = () => {
 
       try {
         const [usersResponse, auditResponse] = await Promise.all([
-          get<User[]>('/users'),
-          get<AuditLogEntry[]>('/audit-logs'),
+          get<User[]>('/admin/users'),
+          get<AuditLogEntry[]>('/admin/audit-logs'),
         ]);
         setUsers(usersResponse);
         setAuditLogs(auditResponse);
@@ -52,7 +52,7 @@ const AdminPage = () => {
 
   const updateRole = async (userId: string, role: string) => {
     try {
-      const updatedUser = await patch<User>(`/users/${userId}`, { role });
+      const updatedUser = await patch<User>(`/admin/users/${userId}`, { role });
       setUsers((current) => current.map((user) => (user.id === userId ? updatedUser : user)));
     } catch (roleError) {
       setError(getApiErrorMessage(roleError, 'Unable to update user role.'));

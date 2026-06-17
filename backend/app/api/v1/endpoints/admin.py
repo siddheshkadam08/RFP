@@ -243,14 +243,16 @@ async def list_audit_logs(
             result = await audit_service.list_audit_logs(db=db, page=page, page_size=page_size, user_id=user_id, action=action)
         else:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin service is not available")
+        items, total = result if isinstance(result, tuple) else (result, None)
         return _success_response(
-            result,
+            items,
             meta={
                 "page": page,
                 "page_size": page_size,
                 "action": action,
                 "resource_type": resource_type,
                 "user_id": user_id,
+                "total": total,
             },
         )
     except AppException:

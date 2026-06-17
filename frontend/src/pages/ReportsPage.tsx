@@ -22,7 +22,7 @@ const ReportsPage = () => {
       setError('');
 
       try {
-        const response = await get<Report[]>('/reports');
+        const response = await get<Report[]>('/reports/');
         setReports(response);
       } catch (loadError) {
         setError(getApiErrorMessage(loadError, 'Unable to load reports.'));

@@ -15,6 +15,7 @@ from app.core.database import get_db
 from app.core.exceptions import AppException
 from app.core.security import TokenPayload, get_current_user
 from app.models.opportunity import OpportunityStatus
+from app.schemas.opportunity import OpportunityListResponse
 
 try:
     from app.schemas.opportunity import CommentCreateRequest, OpportunitySearchFilters, OpportunityUpdateRequest
@@ -100,6 +101,31 @@ def _normalize_search_filters(filters: OpportunitySearchFilters) -> dict[str, An
     return payload
 
 
+def _paginate_opportunities(result: Any, filters: dict[str, Any]) -> Any:
+    """Shape the opportunity-service result into the paginated response contract.
+
+    ``opportunity_service.search_opportunities`` returns an ``(items, total)`` tuple, but the
+    frontend (and the ``OpportunityListResponse`` schema) expect an object with
+    ``items``/``total``/``page``/``page_size``. Returning the raw tuple makes ``data`` an array
+    like ``[[...], total]``, so the client's ``response.items`` is undefined. Unpack the tuple
+    and wrap it here; if a service implementation already returns a mapping/list-response, pass
+    it through unchanged.
+    """
+    if isinstance(result, (OpportunityListResponse, dict)):
+        return result
+
+    if isinstance(result, tuple) and len(result) == 2:
+        items, total = result
+    elif isinstance(result, list):
+        items, total = result, len(result)
+    else:
+        items, total = [result], 1
+
+    page = max(int(filters.get("page", 1) or 1), 1)
+    page_size = max(int(filters.get("page_size", 20) or 20), 1)
+    return OpportunityListResponse(items=items, total=int(total or 0), page=page, page_size=page_size)
+
+
 @router.post("/search", status_code=status.HTTP_200_OK)
 async def search_opportunities(
     filters: OpportunitySearchFilters,
@@ -114,7 +140,7 @@ async def search_opportunities(
             result = await service.search_opportunities(db=db, filters=filters_payload, user_id=current_user.sub)
         except TypeError:
             result = await service.search_opportunities(db=db, filters=filters_payload)
-        return _success_response(result)
+        return _success_response(_paginate_opportunities(result, filters_payload))
     except AppException:
         raise
     except HTTPException:

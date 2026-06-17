@@ -70,7 +70,7 @@ async def list_alerts(
                 page=page,
                 page_size=page_size,
             )
-        except TypeError:
+        except (AttributeError, TypeError):
             result = await service.list_alerts(
                 db=db,
                 user_id=current_user.sub,
@@ -78,7 +78,8 @@ async def list_alerts(
                 page=page,
                 page_size=page_size,
             )
-        return _success_response(result, meta={"page": page, "page_size": page_size, "unread": unread})
+        items, total = result if isinstance(result, tuple) else (result, None)
+        return _success_response(items, meta={"page": page, "page_size": page_size, "unread": unread, "total": total})
     except AppException:
         raise
     except HTTPException:
@@ -105,7 +106,7 @@ async def update_alert(
                 user_id=current_user.sub,
                 is_read=payload.is_read,
             )
-        except TypeError:
+        except (AttributeError, TypeError):
             result = await service.mark_alert_read(db=db, alert_id=alert_id, is_read=payload.is_read)
         return _success_response(result)
     except AppException:
@@ -124,7 +125,7 @@ async def mark_all_read(current_user: CurrentUser, db: DBSession) -> dict[str, A
         service = _get_service()
         try:
             result = await service.mark_all_alerts_read(db=db, user_id=current_user.sub)
-        except TypeError:
+        except (AttributeError, TypeError):
             result = await service.mark_all_read(db=db, user_id=current_user.sub)
         return _success_response(result)
     except AppException:

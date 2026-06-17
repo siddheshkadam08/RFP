@@ -68,7 +68,8 @@ async def list_reports(
             result = await service.list_reports(db=db, user_id=current_user.sub, page=page, page_size=page_size)
         except TypeError:
             result = await service.list_reports(db=db, page=page, page_size=page_size)
-        return _success_response(result, meta={"page": page, "page_size": page_size})
+        items, total = result if isinstance(result, tuple) else (result, None)
+        return _success_response(items, meta={"page": page, "page_size": page_size, "total": total})
     except AppException:
         raise
     except HTTPException:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal_column, select
 
 from app.core.database import AsyncSession
 from app.models.opportunity import Opportunity, OpportunityStatus
@@ -54,12 +54,20 @@ async def get_trends(db: AsyncSession) -> list[dict[str, int | str]]:
     current_week_start = today - timedelta(days=today.weekday())
     start_week = current_week_start - timedelta(weeks=11)
 
+    # Render the truncation unit as a SQL literal (not a bind parameter) and reuse a
+    # single expression object. If we passed "week" as a normal argument, SQLAlchemy
+    # would emit a distinct bind parameter for each occurrence (SELECT/GROUP BY/ORDER BY),
+    # and PostgreSQL cannot prove those parameters are equal -- so it rejects created_at
+    # as not grouped ("must appear in the GROUP BY clause"). A literal makes all three
+    # render identically as date_trunc('week', opportunities.created_at).
+    week = func.date_trunc(literal_column("'week'"), Opportunity.created_at)
+
     rows = (
         await db.execute(
-            select(func.date_trunc("week", Opportunity.created_at), func.count())
+            select(week, func.count())
             .where(Opportunity.created_at >= start_week)
-            .group_by(func.date_trunc("week", Opportunity.created_at))
-            .order_by(func.date_trunc("week", Opportunity.created_at))
+            .group_by(week)
+            .order_by(week)
         )
     ).all()
 

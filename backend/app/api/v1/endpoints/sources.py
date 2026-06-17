@@ -90,7 +90,8 @@ async def list_sources(
             result = await service.list_sources(db=db, page=page, page_size=page_size, user_id=current_user.sub)
         except TypeError:
             result = await service.list_sources(db=db, page=page, page_size=page_size)
-        return _success_response(result, meta={"page": page, "page_size": page_size})
+        items, total = result if isinstance(result, tuple) else (result, None)
+        return _success_response(items, meta={"page": page, "page_size": page_size, "total": total})
     except AppException:
         raise
     except HTTPException:

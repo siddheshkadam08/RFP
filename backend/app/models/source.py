@@ -35,6 +35,35 @@ class CrawlFrequency(str, Enum):
     MONTHLY = "monthly"
 
 
+class SourceDomain(str, Enum):
+    """Business domain a source covers, aligned with the regulator-type taxonomy."""
+
+    CENTRAL_BANK = "central_bank"
+    DEPOSIT_INSURER = "deposit_insurer"
+    BUSINESS_REGISTRY = "business_registry"
+    CAPITAL_MARKET = "capital_market"
+    STOCK_EXCHANGE = "stock_exchange"
+    TAX_AUTHORITY = "tax_authority"
+    STATISTICAL_BODY = "statistical_body"
+    LOCAL_GOVERNMENT = "local_government"
+    OTHER = "other"
+
+
+# Curated region list bound to the source form dropdown. No reference table is
+# maintained in Phase 1, so this constant is the single source of truth and is
+# exposed to the frontend via ``GET /sources/options``.
+SOURCE_REGIONS: list[str] = [
+    "North America",
+    "Latin America & Caribbean",
+    "Europe",
+    "Middle East & North Africa",
+    "Sub-Saharan Africa",
+    "Asia Pacific",
+    "South Asia",
+    "Global",
+]
+
+
 class CrawlStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
@@ -49,7 +78,10 @@ class Source(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     source_type: Mapped[SourceType] = mapped_column(SAEnum(SourceType, name="source_type"), nullable=False)
     frequency: Mapped[CrawlFrequency] = mapped_column(SAEnum(CrawlFrequency, name="crawl_frequency"), nullable=False)
-    country: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Stored as a plain string (validated against SourceDomain at the API boundary)
+    # to avoid a Postgres enum-type migration; nullable for backwards compatibility.
+    domain: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(100), nullable=True)
     region: Mapped[str] = mapped_column(String(100), nullable=False)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

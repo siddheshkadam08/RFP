@@ -5,7 +5,7 @@ from app.models.comment import Comment
 from app.models.document import Document, DocumentType, ProcessingStatus
 from app.models.opportunity import Opportunity, OpportunityCategory, OpportunityStatus
 from app.models.report import Report, ReportStatus, ReportType
-from app.models.source import CrawlStatus, CrawlFrequency, Source, SourceType
+from app.models.source import CrawlStatus, CrawlFrequency, Source, SourceDomain, SourceType
 from app.models.user import User, UserRole
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "ReportStatus",
     "ReportType",
     "Source",
+    "SourceDomain",
     "SourceType",
     "User",
     "UserRole",

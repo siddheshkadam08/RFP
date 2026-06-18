@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.exceptions import AppException
 from app.core.security import TokenPayload, get_current_user, role_required
-from app.models.source import CrawlFrequency, CrawlStatus, SourceType
+from app.models.source import SOURCE_REGIONS, CrawlFrequency, CrawlStatus, Source, SourceDomain, SourceType
 from app.models.user import UserRole
 
 try:
@@ -28,7 +28,8 @@ except ImportError:
         url: str = Field(min_length=1, max_length=2048)
         source_type: SourceType
         frequency: CrawlFrequency
-        country: str = Field(min_length=1, max_length=100)
+        domain: SourceDomain | None = None
+        country: str | None = Field(default=None, max_length=100)
         region: str = Field(min_length=1, max_length=100)
         tags: list[str] = Field(default_factory=list)
         is_active: bool = True
@@ -42,6 +43,7 @@ except ImportError:
         url: str | None = Field(default=None, min_length=1, max_length=2048)
         source_type: SourceType | None = None
         frequency: CrawlFrequency | None = None
+        domain: SourceDomain | None = None
         country: str | None = Field(default=None, min_length=1, max_length=100)
         region: str | None = Field(default=None, min_length=1, max_length=100)
         tags: list[str] | None = None
@@ -64,6 +66,40 @@ AdminUser = Annotated[TokenPayload, Depends(role_required([UserRole.ADMIN.value]
 def _success_response(data: Any, meta: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return the standard API success envelope."""
     return {"success": True, "data": data, "meta": meta or {}}
+
+
+def _enum_value(value: Any) -> Any:
+    """Return an enum's ``.value`` (so JSON gets the string), else the value as-is."""
+    return value.value if hasattr(value, "value") else value
+
+
+def _serialize_source(source: Any) -> Any:
+    """Serialize a Source ORM model into a JSON-safe dict.
+
+    The route handlers are annotated ``-> dict[str, Any]``, so FastAPI serializes
+    the response with pydantic, which cannot handle a raw SQLAlchemy model. Convert
+    it to plain data here (mirrors ``_serialize_user`` in the auth endpoints).
+    Non-Source values pass through unchanged.
+    """
+    if not isinstance(source, Source):
+        return source
+    return {
+        "id": str(source.id),
+        "name": source.name,
+        "url": source.url,
+        "source_type": _enum_value(source.source_type),
+        "frequency": _enum_value(source.frequency),
+        "domain": source.domain,
+        "country": source.country,
+        "region": source.region,
+        "tags": list(source.tags or []),
+        "is_active": source.is_active,
+        "last_crawled_at": source.last_crawl_at.isoformat() if source.last_crawl_at else None,
+        "last_crawl_status": _enum_value(source.last_crawl_status),
+        "success_rate": source.success_rate,
+        "created_at": source.created_at.isoformat() if source.created_at else None,
+        "updated_at": source.updated_at.isoformat() if source.updated_at else None,
+    }
 
 
 def _get_service() -> Any:
@@ -91,7 +127,8 @@ async def list_sources(
         except TypeError:
             result = await service.list_sources(db=db, page=page, page_size=page_size)
         items, total = result if isinstance(result, tuple) else (result, None)
-        return _success_response(items, meta={"page": page, "page_size": page_size, "total": total})
+        serialized = [_serialize_source(item) for item in items]
+        return _success_response(serialized, meta={"page": page, "page_size": page_size, "total": total})
     except AppException:
         raise
     except HTTPException:
@@ -111,7 +148,7 @@ async def create_source(payload: SourceCreateRequest, db: DBSession, current_use
             result = await service.create_source(db=db, source_data=source_data, created_by=current_user.sub)
         except TypeError:
             result = await service.create_source(db=db, source_data=source_data)
-        return _success_response(result)
+        return _success_response(_serialize_source(result))
     except AppException:
         raise
     except HTTPException:
@@ -119,6 +156,23 @@ async def create_source(payload: SourceCreateRequest, db: DBSession, current_use
     except Exception as exc:
         logger.exception("Failed to create source")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create source") from exc
+
+
+@router.get("/options", status_code=status.HTTP_200_OK)
+async def list_source_options(current_user: CurrentUser) -> dict[str, Any]:
+    """Return the allowed values for the source form dropdowns.
+
+    Bound by the frontend so Type, Frequency, Domain, and Region stay in sync
+    with the backend enums and the curated region list (no reference table yet).
+    """
+    return _success_response(
+        {
+            "source_types": [item.value for item in SourceType],
+            "frequencies": [item.value for item in CrawlFrequency],
+            "domains": [item.value for item in SourceDomain],
+            "regions": list(SOURCE_REGIONS),
+        }
+    )
 
 
 @router.get("/{source_id}", status_code=status.HTTP_200_OK)
@@ -130,7 +184,7 @@ async def get_source(source_id: UUID, current_user: CurrentUser, db: DBSession) 
             result = await service.get_source_by_id(db=db, source_id=source_id, user_id=current_user.sub)
         else:
             result = await service.get_source(db=db, source_id=source_id)
-        return _success_response(result)
+        return _success_response(_serialize_source(result))
     except AppException:
         raise
     except HTTPException:
@@ -160,7 +214,7 @@ async def update_source(
             )
         except TypeError:
             result = await service.update_source(db=db, source_id=source_id, update_data=update_data)
-        return _success_response(result)
+        return _success_response(_serialize_source(result))
     except AppException:
         raise
     except HTTPException:

@@ -60,6 +60,7 @@ export interface Source {
   url: string;
   source_type: string;
   frequency: string;
+  domain?: string | null;
   country?: string | null;
   region?: string | null;
   tags: string[];

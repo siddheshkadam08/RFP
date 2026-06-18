@@ -6,11 +6,63 @@ import LoadingSpinner from '@/components/common/LoadingSpinner';
 import { get, getApiErrorMessage, patch, post } from '@/services/api';
 import type { Source } from '@/utils/types';
 
+type SourceOptions = {
+  source_types: string[];
+  frequencies: string[];
+  domains: string[];
+  regions: string[];
+};
+
+// Used until GET /sources/options resolves. Kept in sync with the backend
+// SourceType / CrawlFrequency / SourceDomain enums and SOURCE_REGIONS list.
+const fallbackOptions: SourceOptions = {
+  source_types: [
+    'regulator_website',
+    'tender_portal',
+    'procurement_system',
+    'government_website',
+    'press_release',
+    'rss_feed',
+    'pdf',
+    'annual_report',
+    'news_feed',
+    'funding_portal',
+    'other',
+  ],
+  frequencies: ['hourly', 'daily', 'weekly', 'monthly'],
+  domains: [
+    'central_bank',
+    'deposit_insurer',
+    'business_registry',
+    'capital_market',
+    'stock_exchange',
+    'tax_authority',
+    'statistical_body',
+    'local_government',
+    'other',
+  ],
+  regions: [
+    'North America',
+    'Latin America & Caribbean',
+    'Europe',
+    'Middle East & North Africa',
+    'Sub-Saharan Africa',
+    'Asia Pacific',
+    'South Asia',
+    'Global',
+  ],
+};
+
+// Turn an enum-style value ("regulator_website") into a label ("Regulator Website").
+const humanize = (value: string) => value.replace(/[_-]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+
 const emptySourceForm = {
   name: '',
   url: '',
-  source_type: 'website',
+  source_type: '',
   frequency: 'daily',
+  domain: '',
+  region: '',
 };
 
 const SourcesPage = () => {
@@ -21,6 +73,20 @@ const SourcesPage = () => {
   const [editingSource, setEditingSource] = useState<Source | null>(null);
   const [formValues, setFormValues] = useState(emptySourceForm);
   const [saving, setSaving] = useState(false);
+  const [options, setOptions] = useState<SourceOptions>(fallbackOptions);
+
+  useEffect(() => {
+    const loadOptions = async () => {
+      try {
+        const response = await get<SourceOptions>('/sources/options');
+        setOptions({ ...fallbackOptions, ...response });
+      } catch {
+        // Keep the fallback options if the endpoint is unavailable.
+      }
+    };
+
+    void loadOptions();
+  }, []);
 
   useEffect(() => {
     const loadSources = async () => {
@@ -28,7 +94,7 @@ const SourcesPage = () => {
       setError('');
 
       try {
-        const response = await get<Source[]>('/sources/');
+        const response = await get<Source[]>('endpoints/sources/SourceCreateRequest');
         setSources(response);
       } catch (loadError) {
         setError(getApiErrorMessage(loadError, 'Unable to load sources.'));
@@ -53,6 +119,8 @@ const SourcesPage = () => {
       url: source.url,
       source_type: source.source_type,
       frequency: source.frequency,
+      domain: source.domain ?? '',
+      region: source.region ?? '',
     });
     setIsModalOpen(true);
   };
@@ -68,12 +136,22 @@ const SourcesPage = () => {
     setSaving(true);
     setError('');
 
+    // Omit domain when blank — it is optional and '' is not a valid enum value.
+    const payload = {
+      name: formValues.name,
+      url: formValues.url,
+      source_type: formValues.source_type,
+      frequency: formValues.frequency,
+      region: formValues.region,
+      ...(formValues.domain ? { domain: formValues.domain } : {}),
+    };
+
     try {
       if (editingSource) {
-        const updated = await patch<Source>(`/sources/${editingSource.id}`, formValues);
+        const updated = await patch<Source>(`/sources/${editingSource.id}`, payload);
         setSources((current) => current.map((source) => (source.id === updated.id ? updated : source)));
       } else {
-        const created = await post<Source>('/sources/', formValues);
+        const created = await post<Source>('/sources/', payload);
         setSources((current) => [created, ...current]);
       }
 
@@ -124,7 +202,7 @@ const SourcesPage = () => {
               <table className="min-w-full divide-y divide-slate-200 text-sm">
                 <thead>
                   <tr className="text-left text-slate-500">
-                    {['Name', 'URL', 'Type', 'Frequency', 'Status', 'Last Crawl', 'Success Rate', 'Actions'].map((column) => (
+                    {['Name', 'URL', 'Type', 'Frequency', 'Domain', 'Region', 'Status', 'Last Crawl', 'Success Rate', 'Actions'].map((column) => (
                       <th key={column} className="pb-3 font-medium">
                         {column}
                       </th>
@@ -136,8 +214,10 @@ const SourcesPage = () => {
                     <tr key={source.id} className="text-slate-700">
                       <td className="py-4 pr-4 font-medium text-slate-900">{source.name}</td>
                       <td className="py-4 pr-4 text-blue-600">{source.url}</td>
-                      <td className="py-4 pr-4 capitalize">{source.source_type}</td>
-                      <td className="py-4 pr-4 capitalize">{source.frequency}</td>
+                      <td className="py-4 pr-4">{humanize(source.source_type)}</td>
+                      <td className="py-4 pr-4">{humanize(source.frequency)}</td>
+                      <td className="py-4 pr-4">{source.domain ? humanize(source.domain) : '—'}</td>
+                      <td className="py-4 pr-4">{source.region ?? '—'}</td>
                       <td className="py-4 pr-4">
                         <span
                           className={[
@@ -222,11 +302,16 @@ const SourcesPage = () => {
                     value={formValues.source_type}
                     onChange={(event) => setFormValues((current) => ({ ...current, source_type: event.target.value }))}
                     className="w-full rounded-xl border border-slate-200 px-3 py-2.5 outline-none focus:border-blue-500"
+                    required
                   >
-                    <option value="website">Website</option>
-                    <option value="api">API</option>
-                    <option value="portal">Portal</option>
-                    <option value="newsletter">Newsletter</option>
+                    <option value="" disabled>
+                      Select type
+                    </option>
+                    {options.source_types.map((value) => (
+                      <option key={value} value={value}>
+                        {humanize(value)}
+                      </option>
+                    ))}
                   </select>
                 </label>
                 <label className="block space-y-2 text-sm font-medium text-slate-700">
@@ -235,11 +320,46 @@ const SourcesPage = () => {
                     value={formValues.frequency}
                     onChange={(event) => setFormValues((current) => ({ ...current, frequency: event.target.value }))}
                     className="w-full rounded-xl border border-slate-200 px-3 py-2.5 outline-none focus:border-blue-500"
+                    required
                   >
-                    <option value="hourly">Hourly</option>
-                    <option value="daily">Daily</option>
-                    <option value="weekly">Weekly</option>
-                    <option value="monthly">Monthly</option>
+                    {options.frequencies.map((value) => (
+                      <option key={value} value={value}>
+                        {humanize(value)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block space-y-2 text-sm font-medium text-slate-700">
+                  <span>Domain</span>
+                  <select
+                    value={formValues.domain}
+                    onChange={(event) => setFormValues((current) => ({ ...current, domain: event.target.value }))}
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2.5 outline-none focus:border-blue-500"
+                  >
+                    <option value="">Select domain (optional)</option>
+                    {options.domains.map((value) => (
+                      <option key={value} value={value}>
+                        {humanize(value)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block space-y-2 text-sm font-medium text-slate-700">
+                  <span>Region</span>
+                  <select
+                    value={formValues.region}
+                    onChange={(event) => setFormValues((current) => ({ ...current, region: event.target.value }))}
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2.5 outline-none focus:border-blue-500"
+                    required
+                  >
+                    <option value="" disabled>
+                      Select region
+                    </option>
+                    {options.regions.map((value) => (
+                      <option key={value} value={value}>
+                        {value}
+                      </option>
+                    ))}
                   </select>
                 </label>
               </div>

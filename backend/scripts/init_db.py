@@ -48,6 +48,30 @@ async def create_tables() -> None:
     logger.info("Database tables are ready (created any that were missing).")
 
 
+async def patch_schema() -> None:
+    """Apply idempotent column tweaks that ``create_all`` cannot do on its own.
+
+    ``Base.metadata.create_all`` only creates *missing* tables; it never alters an
+    existing one. These statements bring an already-created ``sources`` table up to
+    date (add ``domain``, allow a null ``country``) and are safe to re-run.
+    """
+    from sqlalchemy import text
+
+    statements = (
+        "ALTER TABLE sources ADD COLUMN IF NOT EXISTS domain VARCHAR(100)",
+        "ALTER TABLE sources ALTER COLUMN country DROP NOT NULL",
+    )
+    # Each statement gets its own transaction: a failure on Postgres aborts the
+    # whole transaction, which would otherwise cascade to the next statement.
+    for statement in statements:
+        try:
+            async with engine.begin() as conn:
+                await conn.exec_driver_sql(statement)
+        except Exception as exc:  # noqa: BLE001 - best-effort, idempotent patch
+            logger.warning("Schema patch skipped (%s): %s", statement, exc)
+    logger.info("Schema patches applied (domain column, nullable country).")
+
+
 async def seed_admin() -> None:
     """Create the first admin user if one does not already exist."""
     email = os.getenv("ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL).strip().lower()
@@ -76,6 +100,7 @@ async def seed_admin() -> None:
 async def main() -> None:
     try:
         await create_tables()
+        await patch_schema()
         await seed_admin()
     finally:
         await engine.dispose()

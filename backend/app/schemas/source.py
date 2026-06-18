@@ -13,6 +13,7 @@ class SourceCreate(SchemaBase):
     url: AnyHttpUrl
     source_type: str
     frequency: str
+    domain: str | None = None
     country: str | None = None
     region: str | None = None
     tags: list[str] | None = None
@@ -22,6 +23,8 @@ class SourceUpdate(SchemaBase):
     name: str | None = None
     url: AnyHttpUrl | None = None
     frequency: str | None = None
+    domain: str | None = None
+    region: str | None = None
     is_active: bool | None = None
     tags: list[str] | None = None
 
@@ -34,6 +37,7 @@ class SourceResponse(SchemaBase):
     url: AnyHttpUrl
     source_type: str
     frequency: str
+    domain: str | None = None
     country: str | None = None
     region: str | None = None
     tags: list[str] = Field(default_factory=list)

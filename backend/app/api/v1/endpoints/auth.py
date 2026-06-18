@@ -6,6 +6,7 @@ import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -107,6 +108,38 @@ async def login(payload: LoginRequest, db: DBSession) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("Failed to login user")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to login user") from exc
+
+
+@router.post("/token", status_code=status.HTTP_200_OK)
+async def login_for_access_token(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: DBSession,
+) -> dict[str, Any]:
+    """OAuth2 password-flow token endpoint.
+
+    This exists for the Swagger "Authorize" button (and any standard OAuth2 client):
+    it accepts form-encoded ``username`` (use the email) and ``password`` and returns
+    a bearer token in the OAuth2 shape ``{access_token, token_type}``. The web app
+    keeps using the JSON ``/auth/login`` endpoint above.
+    """
+    try:
+        service = _get_service()
+        user = await service.authenticate_user(db, form_data.username, form_data.password)
+        if user is None:
+            raise UnauthorizedException("Invalid email or password")
+        role = user.role.value if hasattr(user.role, "value") else str(user.role)
+        token = create_access_token(subject=str(user.id), email=user.email, roles=[role])
+        return {"access_token": token, "token_type": "bearer"}
+    except AppException:
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to issue access token")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to issue access token",
+        ) from exc
 
 
 @router.get("/me", status_code=status.HTTP_200_OK)

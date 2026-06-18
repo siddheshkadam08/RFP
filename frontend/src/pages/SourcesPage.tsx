@@ -94,7 +94,7 @@ const SourcesPage = () => {
       setError('');
 
       try {
-        const response = await get<Source[]>('endpoints/sources/SourceCreateRequest');
+        const response = await get<Source[]>('/sources/');
         setSources(response);
       } catch (loadError) {
         setError(getApiErrorMessage(loadError, 'Unable to load sources.'));

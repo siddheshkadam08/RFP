@@ -9,6 +9,13 @@ from typing import Any
 
 import httpx
 
+from app.agents.prompts import (
+    CLASSIFICATION_PROMPT,
+    EXTRACTION_PROMPT,
+    RELEVANCE_PROMPT,
+    SCORING_PROMPT,
+    SUMMARIZE_PROMPT,
+)
 from app.core.config import settings
 from app.core.exceptions import AIServiceException
 
@@ -228,10 +235,7 @@ async def check_relevance(content: str) -> dict[str, Any]:
             [
                 {
                     "role": "system",
-                    "content": (
-                        "Determine whether the content relates to SupTech or RegTech opportunities. "
-                        "Return strict JSON with keys relevant, confidence, and reason."
-                    ),
+                    "content": RELEVANCE_PROMPT.replace("{content}", "").strip(),
                 },
                 {"role": "user", "content": content},
             ]
@@ -266,10 +270,7 @@ async def extract_opportunity(content: str) -> dict[str, Any]:
             [
                 {
                     "role": "system",
-                    "content": (
-                        "Extract opportunity data and return strict JSON with keys title, country, institution, "
-                        "standards, budget, deadline, and scope."
-                    ),
+                    "content": EXTRACTION_PROMPT.replace("{content}", "").strip(),
                 },
                 {"role": "user", "content": content},
             ]
@@ -302,11 +303,7 @@ async def classify_opportunity(content: str) -> str:
             [
                 {
                     "role": "system",
-                    "content": (
-                        "Classify the opportunity into one of: suptech, regtech, analytics, risk, taxonomy, "
-                        "reporting, deposit_insurance, data_collection, workflow, validation. "
-                        "Return only the category name."
-                    ),
+                    "content": CLASSIFICATION_PROMPT.replace("{content}", "").strip(),
                 },
                 {"role": "user", "content": content},
             ]
@@ -327,10 +324,7 @@ async def score_opportunity(opportunity_data: dict[str, Any]) -> dict[str, Any]:
             [
                 {
                     "role": "system",
-                    "content": (
-                        "Score the opportunity and return strict JSON with a breakdown object containing strategic, "
-                        "budget, timeline, technology, and competition values from 0-100."
-                    ),
+                    "content": SCORING_PROMPT.replace("{opportunity_data}", "").strip(),
                 },
                 {"role": "user", "content": json.dumps(opportunity_data, default=str)},
             ]
@@ -410,7 +404,7 @@ async def summarize_document(content: str) -> str:
     try:
         return await chat_completion(
             [
-                {"role": "system", "content": "Summarize the document in a concise paragraph focusing on procurement relevance."},
+                {"role": "system", "content": SUMMARIZE_PROMPT.replace("{content}", "").strip()},
                 {"role": "user", "content": content},
             ]
         )

@@ -291,7 +291,7 @@ Score Bands: **High** (71-100) | **Medium** (41-70) | **Low** (0-40)
 | `AZURE_OPENAI_API_KEY` | Azure OpenAI API key | (required for AI) |
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL | (required for AI) |
 | `AZURE_OPENAI_DEPLOYMENT` | GPT model deployment name | `gpt-4` |
-| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | Embedding model name | `text-embedding-ada-002` |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | Embedding model name | `text-embedding-3-large` |
 | `CELERY_BROKER_URL` | Celery broker URL | `redis://localhost:6379/1` |
 
 ## User Roles

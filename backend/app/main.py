@@ -7,6 +7,7 @@ import logging
 import pkgutil
 
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -105,7 +106,9 @@ def create_application() -> FastAPI:
                 "error": {
                     "code": "request_validation_error",
                     "message": "Request validation failed",
-                    "details": exc.errors(),
+                    # jsonable_encoder decodes any bytes in the error context (e.g. raw
+                    # form/body input) that json.dumps would otherwise choke on.
+                    "details": jsonable_encoder(exc.errors()),
                 }
             },
         )

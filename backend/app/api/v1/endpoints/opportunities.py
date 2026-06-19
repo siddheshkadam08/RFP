@@ -8,14 +8,23 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.exceptions import AppException
+from app.core.geo import SOURCE_COUNTRIES, SOURCE_REGIONS
 from app.core.security import TokenPayload, get_current_user
-from app.models.opportunity import OpportunityStatus
-from app.schemas.opportunity import OpportunityListResponse
+from app.models.opportunity import Opportunity, OpportunityCategory, OpportunityStatus
+from app.schemas.opportunity import OpportunityListResponse, OpportunityResponse
+
+# Standards taxonomy tracked by the platform (per the spec); bound to the Explorer filter.
+OPPORTUNITY_STANDARDS = ["XBRL", "iXBRL", "XBRL-CSV", "XBRL-JSON", "SDMX", "ISO 20022", "DPM", "Taxonomies"]
+
+
+def _humanize(value: str) -> str:
+    return value.replace("_", " ").title()
 
 try:
     from app.schemas.opportunity import CommentCreateRequest, OpportunitySearchFilters, OpportunityUpdateRequest
@@ -81,6 +90,18 @@ def _get_service() -> Any:
 def _model_dump(payload: Any) -> dict[str, Any]:
     """Return a dictionary representation of a request payload."""
     return payload.model_dump(exclude_none=True) if hasattr(payload, "model_dump") else dict(payload)
+
+
+def _serialize_opportunity(opportunity: Any) -> Any:
+    """Serialize an Opportunity ORM model to the response schema.
+
+    Returning a raw SQLAlchemy model from a ``dict[str, Any]`` route makes FastAPI's
+    pydantic serializer fail (500). ``OpportunityResponse`` also fills ``summary`` from
+    ``ai_summary``. Non-ORM values pass through unchanged.
+    """
+    if isinstance(opportunity, Opportunity):
+        return OpportunityResponse.model_validate(opportunity)
+    return opportunity
 
 
 def _normalize_search_filters(filters: OpportunitySearchFilters) -> dict[str, Any]:
@@ -153,6 +174,62 @@ async def search_opportunities(
         ) from exc
 
 
+@router.get("/options", status_code=status.HTTP_200_OK)
+async def list_opportunity_options(current_user: CurrentUser) -> dict[str, Any]:
+    """Return the allowed filter values for the Opportunity Explorer.
+
+    Bound by the frontend so Category/Status/Region/Country/Standards filters stay in
+    sync with the backend enums (otherwise hardcoded mismatches make filters return
+    nothing).
+    """
+    return _success_response(
+        {
+            "categories": [{"value": item.value, "label": _humanize(item.value)} for item in OpportunityCategory],
+            "statuses": [{"value": item.value, "label": _humanize(item.value)} for item in OpportunityStatus],
+            "regions": list(SOURCE_REGIONS),
+            "countries": list(SOURCE_COUNTRIES),
+            "standards": list(OPPORTUNITY_STANDARDS),
+        }
+    )
+
+
+@router.post("/export", status_code=status.HTTP_200_OK)
+async def export_opportunities(
+    filters: OpportunitySearchFilters,
+    current_user: CurrentUser,
+    db: DBSession,
+) -> StreamingResponse:
+    """Export the filtered opportunities as a formatted .xlsx workbook."""
+    from app.services.export_service import build_opportunities_workbook
+
+    try:
+        service = _get_service()
+        filters_payload = _normalize_search_filters(filters)
+        filters_payload["page"] = 1
+        filters_payload["page_size"] = 10000  # export the full filtered set, not one page
+        try:
+            result = await service.search_opportunities(db=db, filters=filters_payload, user_id=current_user.sub)
+        except TypeError:
+            result = await service.search_opportunities(db=db, filters=filters_payload)
+        items = result[0] if isinstance(result, tuple) else result
+        content = build_opportunities_workbook(items)
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="opportunities.xlsx"'},
+        )
+    except AppException:
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to export opportunities")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to export opportunities",
+        ) from exc
+
+
 @router.get("/{opportunity_id}", status_code=status.HTTP_200_OK)
 async def get_opportunity(opportunity_id: UUID, current_user: CurrentUser, db: DBSession) -> dict[str, Any]:
     """Return detailed information for a single opportunity."""
@@ -162,7 +239,7 @@ async def get_opportunity(opportunity_id: UUID, current_user: CurrentUser, db: D
             result = await service.get_opportunity_by_id(db=db, opportunity_id=opportunity_id, user_id=current_user.sub)
         else:
             result = await service.get_opportunity(db=db, opp_id=opportunity_id)
-        return _success_response(result)
+        return _success_response(_serialize_opportunity(result))
     except AppException:
         raise
     except HTTPException:
@@ -195,7 +272,7 @@ async def update_opportunity(
             )
         except TypeError:
             result = await service.update_opportunity(db=db, opp_id=opportunity_id, update_data=update_data)
-        return _success_response(result)
+        return _success_response(_serialize_opportunity(result))
     except AppException:
         raise
     except HTTPException:

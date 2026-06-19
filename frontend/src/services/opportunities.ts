@@ -1,4 +1,4 @@
-import { get, patch, post } from '@/services/api';
+import api, { get, patch, post } from '@/services/api';
 import type {
   Comment,
   Opportunity,
@@ -7,8 +7,25 @@ import type {
   SearchFilters,
 } from '@/utils/types';
 
+export type OpportunityOptions = {
+  categories: { value: string; label: string }[];
+  statuses: { value: string; label: string }[];
+  regions: string[];
+  countries: string[];
+  standards: string[];
+};
+
 export const searchOpportunities = (filters: SearchFilters) =>
   post<PaginatedResponse<Opportunity>>('/opportunities/search', filters);
+
+export const getOpportunityOptions = () => get<OpportunityOptions>('/opportunities/options');
+
+// Download the filtered opportunities as .xlsx. Goes through the axios client (not the
+// json `post` wrapper) so the Bearer token is sent and the blob isn't envelope-unwrapped.
+export const exportOpportunities = async (filters: SearchFilters): Promise<Blob> => {
+  const response = await api.post('/opportunities/export', filters, { responseType: 'blob' });
+  return response.data as Blob;
+};
 
 export const getOpportunity = (id: string) =>
   get<OpportunityDetail>(`/opportunities/${id}`);

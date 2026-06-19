@@ -6,22 +6,14 @@ import {
   Target,
   TrendingUp,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
-import {
-  Area,
-  AreaChart,
-  Bar,
-  BarChart,
-  CartesianGrid,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
+import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 
 import Badge, { formatStatusLabel, getScoreVariant, getStatusBadgeClass } from '@/components/common/Badge';
 import EmptyState from '@/components/common/EmptyState';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
+import WorldHeatmap from '@/components/common/WorldHeatmap';
 import { getApiErrorMessage } from '@/services/api';
 import { getHeatmap, getSummary, getTrends } from '@/services/dashboard';
 import { searchOpportunities } from '@/services/opportunities';
@@ -30,6 +22,7 @@ import type { DashboardSummary, HeatmapData, Opportunity, TrendData } from '@/ut
 const kpiCardSkeleton = Array.from({ length: 6 }, (_, index) => index);
 
 const DashboardPage = () => {
+  const navigate = useNavigate();
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [trends, setTrends] = useState<TrendData[]>([]);
   const [heatmap, setHeatmap] = useState<HeatmapData[]>([]);
@@ -67,17 +60,6 @@ const DashboardPage = () => {
 
     void loadDashboard();
   }, []);
-
-  const regionTotals = useMemo(() => {
-    const totals = heatmap.reduce<Record<string, number>>((accumulator, item) => {
-      accumulator[item.region] = (accumulator[item.region] ?? 0) + item.count;
-      return accumulator;
-    }, {});
-
-    return Object.entries(totals)
-      .map(([region, count]) => ({ region, count }))
-      .sort((left, right) => right.count - left.count);
-  }, [heatmap]);
 
   const kpis = summary
     ? [
@@ -184,31 +166,14 @@ const DashboardPage = () => {
 
         <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
           <div className="mb-6">
-            <h3 className="text-lg font-semibold text-slate-900">Region Heatmap</h3>
-            <p className="text-sm text-slate-500">Opportunity concentration by region</p>
+            <h3 className="text-lg font-semibold text-slate-900">Geographic Heatmap</h3>
+            <p className="text-sm text-slate-500">Opportunity concentration by country</p>
           </div>
 
           {loading ? (
             <div className="h-80 animate-pulse rounded-2xl bg-slate-100" />
-          ) : regionTotals.length ? (
-            <div className="h-80">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={regionTotals} layout="vertical" margin={{ left: 12 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" horizontal={false} />
-                  <XAxis type="number" tickLine={false} axisLine={false} tick={{ fill: '#64748B', fontSize: 12 }} />
-                  <YAxis
-                    type="category"
-                    dataKey="region"
-                    tickLine={false}
-                    axisLine={false}
-                    tick={{ fill: '#64748B', fontSize: 12 }}
-                    width={110}
-                  />
-                  <Tooltip />
-                  <Bar dataKey="count" fill="#2563EB" radius={[0, 8, 8, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
+          ) : heatmap.length ? (
+            <WorldHeatmap data={heatmap} />
           ) : (
             <EmptyState icon={Globe2} title="No region data found" description="Heatmap data will appear when source crawls generate regional opportunity matches." />
           )}
@@ -240,7 +205,11 @@ const DashboardPage = () => {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {topOpportunities.map((opportunity) => (
-                  <tr key={opportunity.id} className="text-slate-700">
+                  <tr
+                    key={opportunity.id}
+                    className="cursor-pointer text-slate-700 transition hover:bg-blue-50/50"
+                    onClick={() => navigate(`/opportunities/${opportunity.id}`)}
+                  >
                     <td className="py-4 pr-4">
                       <div>
                         <p className="font-medium text-slate-900">{opportunity.title}</p>
@@ -248,7 +217,7 @@ const DashboardPage = () => {
                       </div>
                     </td>
                     <td className="py-4 pr-4">{opportunity.country ?? '—'}</td>
-                    <td className="py-4 pr-4">{opportunity.category ?? '—'}</td>
+                    <td className="py-4 pr-4">{opportunity.category ? formatStatusLabel(opportunity.category) : '—'}</td>
                     <td className="py-4 pr-4">
                       <Badge text={`${opportunity.score ?? 0}`} variant={getScoreVariant(opportunity.score)} size="md" />
                     </td>

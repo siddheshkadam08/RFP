@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
 
 from app.schemas.common import SchemaBase
 
@@ -30,21 +31,34 @@ class OpportunityResponse(SchemaBase):
     title: str
     description: str | None = None
     summary: str | None = None
+    ai_summary: str | None = None
+    ai_reasoning: str | None = None
     region: str | None = None
     country: str | None = None
     category: str | None = None
     institution: str | None = None
     standards: list[str] = Field(default_factory=list)
+    budget: str | None = None
     score: int | None = Field(default=None, ge=0, le=100)
+    score_breakdown: dict[str, Any] = Field(default_factory=dict)
     status: str
     owner_id: UUID | None = None
     source_id: UUID | None = None
+    source_url: str | None = None
     notes: str | None = None
     tags: list[str] = Field(default_factory=list)
     published_at: datetime | None = None
     deadline: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def _populate_summary(self) -> "OpportunityResponse":
+        """The model stores the AI summary as ``ai_summary``; expose it as ``summary``
+        (the name the spec and UI use) so a summary is always available."""
+        if not self.summary:
+            self.summary = self.ai_summary
+        return self
 
 
 class OpportunityUpdate(SchemaBase):

@@ -60,8 +60,22 @@ def _apply_filters(stmt, filters: dict[str, Any]):
     return stmt
 
 
+_SORT_COLUMNS = {
+    "title": Opportunity.title,
+    "country": Opportunity.country,
+    "region": Opportunity.region,
+    "institution": Opportunity.institution,
+    "category": Opportunity.category,
+    "score": Opportunity.score,
+    "status": Opportunity.status,
+    "created_at": Opportunity.created_at,
+    "updated_at": Opportunity.updated_at,
+    "deadline": Opportunity.deadline,
+}
+
+
 async def search_opportunities(db: AsyncSession, filters: dict[str, Any]) -> tuple[list[Opportunity], int]:
-    """Search opportunities with filtering and pagination."""
+    """Search opportunities with filtering, sorting, and pagination."""
     page = max(int(filters.get("page", 1)), 1)
     page_size = max(int(filters.get("page_size", 20)), 1)
     offset = (page - 1) * page_size
@@ -70,10 +84,25 @@ async def search_opportunities(db: AsyncSession, filters: dict[str, Any]) -> tup
     total_stmt = select(func.count()).select_from(base_stmt.order_by(None).subquery())
     total = await db.scalar(total_stmt)
 
-    result = await db.execute(
-        base_stmt.order_by(Opportunity.created_at.desc()).offset(offset).limit(page_size)
-    )
+    column = _SORT_COLUMNS.get(str(filters.get("sort_by") or "created_at"), Opportunity.created_at)
+    order = column.asc() if str(filters.get("sort_dir") or "desc").lower() == "asc" else column.desc()
+
+    result = await db.execute(base_stmt.order_by(order).offset(offset).limit(page_size))
     return list(result.scalars().all()), int(total or 0)
+
+
+async def create_opportunity(db: AsyncSession, opportunity_data: dict[str, Any]) -> Opportunity:
+    """Create an opportunity record."""
+    opportunity = Opportunity(**dict(opportunity_data))
+    try:
+        db.add(opportunity)
+        await db.commit()
+        await db.refresh(opportunity)
+        return opportunity
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to create opportunity")
+        raise
 
 
 async def get_opportunity(db: AsyncSession, opp_id: Any) -> Opportunity:

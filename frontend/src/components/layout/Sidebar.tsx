@@ -19,14 +19,16 @@ interface SidebarProps {
   onClose: () => void;
 }
 
+// Ordered to follow the workflow: configure Sources -> review Opportunities they
+// produce -> Search across them -> analyze with the Copilot -> Reports -> Alerts.
 const navigation = [
   { label: 'Dashboard', href: '/', icon: LayoutDashboard },
+  { label: 'Sources', href: '/sources', icon: Globe },
   { label: 'Opportunities', href: '/opportunities', icon: Target },
   { label: 'Search', href: '/search', icon: Search },
   { label: 'AI Copilot', href: '/copilot', icon: Bot },
   { label: 'Reports', href: '/reports', icon: FileText },
   { label: 'Alerts', href: '/alerts', icon: Bell },
-  { label: 'Sources', href: '/sources', icon: Globe },
   { label: 'Admin', href: '/admin', icon: Settings, adminOnly: true },
 ];
 

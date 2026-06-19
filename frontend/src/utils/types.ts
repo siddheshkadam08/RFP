@@ -113,6 +113,8 @@ export interface ChatCitation {
   title?: string;
   url?: string;
   snippet?: string;
+  opportunity_id?: string;
+  source_url?: string;
 }
 
 export interface ChatMessage {
@@ -130,6 +132,20 @@ export interface ChatResponse {
   citations: ChatCitation[];
   confidence: number;
   session_id: string;
+}
+
+export interface ChatSessionSummary {
+  id: string;
+  title: string;
+  updated_at: string | null;
+  message_count: number;
+}
+
+export interface ChatSessionDetail {
+  id: string;
+  title: string;
+  updated_at: string | null;
+  messages: ChatMessage[];
 }
 
 export interface DashboardSummary {

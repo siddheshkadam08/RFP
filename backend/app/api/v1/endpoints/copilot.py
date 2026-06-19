@@ -52,6 +52,11 @@ try:
 except ImportError:
     ai_service = None
 
+try:
+    from app.services import copilot_service
+except ImportError:
+    copilot_service = None
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai", tags=["ai"])
 
@@ -74,6 +79,16 @@ def _get_service() -> Any:
     return ai_service
 
 
+def _get_copilot_service() -> Any:
+    """Return the grounded copilot service or raise a service unavailable error."""
+    if copilot_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI copilot service is not available",
+        )
+    return copilot_service
+
+
 async def _load_document_context(db: AsyncSession, document_ids: list[UUID]) -> list[dict[str, Any]]:
     """Load document snippets for AI context."""
     if not document_ids:
@@ -93,15 +108,10 @@ async def _load_document_context(db: AsyncSession, document_ids: list[UUID]) -> 
 
 @router.post("/chat", status_code=status.HTTP_200_OK)
 async def chat(payload: ChatRequest, current_user: CurrentUser, db: DBSession) -> dict[str, Any]:
-    """Handle the main AI copilot chat workflow."""
+    """Grounded RAG chat: retrieve from the corpus, answer with citations, persist the session."""
     try:
-        service = _get_service()
-        context_payload = getattr(payload, "context", {}) or {}
-        context_items = context_payload.get("items", []) if isinstance(context_payload, dict) else []
-        if hasattr(service, "chat"):
-            result = await service.chat(db=db, user_id=current_user.sub, chat_request=payload)
-        else:
-            result = await service.copilot_chat(message=payload.message, context=context_items, history=[])
+        service = _get_copilot_service()
+        result = await service.chat(db=db, user_id=current_user.sub, chat_request=payload)
         return _success_response(result)
     except AppException:
         raise
@@ -110,6 +120,40 @@ async def chat(payload: ChatRequest, current_user: CurrentUser, db: DBSession) -
     except Exception as exc:
         logger.exception("AI chat request failed")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="AI chat request failed") from exc
+
+
+@router.get("/sessions", status_code=status.HTTP_200_OK)
+async def list_sessions(current_user: CurrentUser, db: DBSession) -> dict[str, Any]:
+    """List the current user's chat sessions for the copilot history sidebar."""
+    try:
+        service = _get_copilot_service()
+        result = await service.list_sessions(db=db, user_id=current_user.sub)
+        return _success_response(result)
+    except AppException:
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Listing chat sessions failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Listing chat sessions failed") from exc
+
+
+@router.get("/sessions/{session_id}", status_code=status.HTTP_200_OK)
+async def get_session(session_id: UUID, current_user: CurrentUser, db: DBSession) -> dict[str, Any]:
+    """Return one chat session's full transcript (replayed in the UI)."""
+    try:
+        service = _get_copilot_service()
+        result = await service.get_session(db=db, user_id=current_user.sub, session_id=session_id)
+        if result is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat session not found")
+        return _success_response(result)
+    except AppException:
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Fetching chat session failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Fetching chat session failed") from exc
 
 
 @router.post("/summarize", status_code=status.HTTP_200_OK)

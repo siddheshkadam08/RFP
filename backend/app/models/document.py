@@ -5,9 +5,11 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import JSON, DateTime, Enum as SAEnum, Float, ForeignKey, String, Text, Uuid, func
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import JSON, DateTime, Enum as SAEnum, Float, ForeignKey, Integer, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.config import settings
 from app.core.database import Base
 
 if TYPE_CHECKING:
@@ -55,3 +57,16 @@ class Document(Base):
 
     source: Mapped[Source] = relationship(back_populates="documents")
     opportunities: Mapped[list[Opportunity]] = relationship(back_populates="document")
+
+
+class DocumentEmbedding(Base):
+    """A chunk of a document's text plus its embedding (for semantic doc-corpus search)."""
+
+    __tablename__ = "document_embeddings"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id"), nullable=False, index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.EMBEDDING_DIM), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

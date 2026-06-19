@@ -5,9 +5,11 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import CheckConstraint, JSON, DateTime, Enum as SAEnum, ForeignKey, Integer, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.config import settings
 from app.core.database import Base
 
 if TYPE_CHECKING:
@@ -67,6 +69,9 @@ class Opportunity(Base):
     ai_summary: Mapped[str] = mapped_column(Text, nullable=False)
     ai_reasoning: Mapped[str] = mapped_column(Text, nullable=False)
     source_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # Semantic-search vector (title + AI summary), null until embedded. Dim must match
+    # the embedding model (text-embedding-3-small -> 1536). See app.core.config.EMBEDDING_DIM.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.EMBEDDING_DIM), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False

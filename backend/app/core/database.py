@@ -44,6 +44,10 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
+# Note: pgvector's SQLAlchemy ``Vector`` type handles asyncpg serialization on its own
+# (as text). Do NOT also call pgvector.asyncpg.register_vector — its binary codec
+# conflicts with the type's string bind processor.
+
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Yield a database session for request-scoped dependencies."""

@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     AZURE_OPENAI_DEPLOYMENT: str = "gpt-4"
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT: str = "text-embedding-3-large"
     AZURE_OPENAI_API_VERSION: str = "2024-02-15-preview"
+    # Embeddings may live on a SEPARATE Azure OpenAI resource (different endpoint/key/
+    # version) than chat. Blank values fall back to the chat resource above.
+    AZURE_OPENAI_EMBEDDING_ENDPOINT: str = ""
+    AZURE_OPENAI_EMBEDDING_API_KEY: str = ""
+    AZURE_OPENAI_EMBEDDING_API_VERSION: str = ""
+    EMBEDDING_DIM: int = 1536
 
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 
@@ -75,6 +81,13 @@ class Settings(BaseSettings):
         """Populate settings whose defaults depend on other values."""
         if not self.CELERY_BROKER_URL:
             self.CELERY_BROKER_URL = self.REDIS_URL
+        # Embedding resource falls back to the chat resource when not set separately.
+        if not self.AZURE_OPENAI_EMBEDDING_ENDPOINT:
+            self.AZURE_OPENAI_EMBEDDING_ENDPOINT = self.AZURE_OPENAI_ENDPOINT
+        if not self.AZURE_OPENAI_EMBEDDING_API_KEY:
+            self.AZURE_OPENAI_EMBEDDING_API_KEY = self.AZURE_OPENAI_API_KEY
+        if not self.AZURE_OPENAI_EMBEDDING_API_VERSION:
+            self.AZURE_OPENAI_EMBEDDING_API_VERSION = self.AZURE_OPENAI_API_VERSION
         return self
 
 

@@ -98,16 +98,32 @@ async def chat_completion(messages: list[dict[str, Any]], model: str = "small") 
     raise AIServiceException("Chat completion failed")
 
 
+def _ensure_embedding_configured() -> None:
+    if not settings.AZURE_OPENAI_EMBEDDING_API_KEY or not settings.AZURE_OPENAI_EMBEDDING_ENDPOINT:
+        raise AIServiceException("Azure OpenAI embedding configuration is incomplete")
+
+
+def _embedding_url() -> str:
+    endpoint = settings.AZURE_OPENAI_EMBEDDING_ENDPOINT.rstrip("/")
+    return (
+        f"{endpoint}/openai/deployments/{settings.AZURE_OPENAI_EMBEDDING_DEPLOYMENT}/embeddings"
+        f"?api-version={settings.AZURE_OPENAI_EMBEDDING_API_VERSION}"
+    )
+
+
+def _embedding_headers() -> dict[str, str]:
+    return {"api-key": settings.AZURE_OPENAI_EMBEDDING_API_KEY, "Content-Type": "application/json"}
+
+
 async def get_embedding(text: str) -> list[float]:
-    """Generate an embedding vector for the provided text."""
-    _ensure_configured()
-    deployment = settings.AZURE_OPENAI_EMBEDDING_DEPLOYMENT
+    """Generate an embedding using the (possibly separate) Azure embedding resource."""
+    _ensure_embedding_configured()
     payload = {"input": text}
 
     for attempt in range(1, 4):
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-                response = await client.post(_build_url(deployment, "embeddings"), headers=_headers(), json=payload)
+                response = await client.post(_embedding_url(), headers=_embedding_headers(), json=payload)
                 response.raise_for_status()
                 data = response.json().get("data") or []
                 if not data or "embedding" not in data[0]:
@@ -275,7 +291,11 @@ async def extract_opportunity(content: str) -> dict[str, Any]:
                 {"role": "user", "content": content},
             ]
         )
-        default.update(result)
+        # Some models wrap the object in a single-element list — unwrap it.
+        if isinstance(result, list) and result and isinstance(result[0], dict):
+            result = result[0]
+        if isinstance(result, dict):
+            default.update(result)
         if not isinstance(default.get("standards"), list):
             default["standards"] = []
         return default

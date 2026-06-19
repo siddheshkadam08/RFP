@@ -153,14 +153,26 @@ export interface HeatmapData {
 }
 
 export interface SearchResult {
+  id: string;
   opportunity_id: string;
   title: string;
   score?: number | null;
-  relevance_score: number;
+  relevance_score?: number | null;
   snippet?: string | null;
+  summary?: string | null;
   country?: string | null;
   region?: string | null;
   category?: string | null;
+  institution?: string | null;
+  status?: string | null;
+  source_url?: string | null;
+}
+
+export interface SearchResponse {
+  items: SearchResult[];
+  total: number;
+  page: number;
+  page_size: number;
 }
 
 export interface SearchFilters {
@@ -175,6 +187,8 @@ export interface SearchFilters {
   date_to?: string;
   query?: string;
   mode?: 'keyword' | 'semantic' | 'hybrid';
+  sort_by?: string;
+  sort_dir?: 'asc' | 'desc';
   page?: number;
   page_size?: number;
 }

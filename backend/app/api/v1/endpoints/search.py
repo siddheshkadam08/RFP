@@ -77,17 +77,41 @@ def _page_args(payload: Any) -> tuple[int, int]:
     return page, page_size
 
 
+def _search_filters(payload: Any) -> dict[str, Any]:
+    """Pull optional region/category/status filters out of the request payload."""
+    data = payload.model_dump(exclude_none=True) if hasattr(payload, "model_dump") else dict(payload)
+    return {key: data[key] for key in ("regions", "categories", "status") if data.get(key)}
+
+
+def _paginated_response(result: Any, page: int, page_size: int) -> dict[str, Any]:
+    """Normalize a service result (``(items, total)`` tuple, dict, or bare list) into the
+    standard ``{items, total, page, page_size}`` envelope."""
+    if isinstance(result, tuple):
+        items, total = result
+    elif isinstance(result, dict):
+        items, total = result.get("items", []), result.get("total", 0)
+    else:
+        items = result or []
+        total = len(items)
+    items = items or []
+    return _success_response(
+        {"items": items, "total": int(total or 0), "page": page, "page_size": page_size},
+        meta={"page": page, "page_size": page_size},
+    )
+
+
 @router.post("/keyword", status_code=status.HTTP_200_OK)
 async def keyword_search(payload: KeywordSearchRequest, current_user: CurrentUser, db: DBSession) -> dict[str, Any]:
     """Run a keyword-based search across indexed opportunities."""
     try:
         service = _get_service()
         page, page_size = _page_args(payload)
+        filters = _search_filters(payload)
         try:
             result = await service.keyword_search(db=db, search_request=payload, user_id=current_user.sub)
         except TypeError:
-            result = await service.keyword_search(db=db, query=payload.query, page=page, page_size=page_size)
-        return _success_response(result, meta={"page": page, "page_size": page_size})
+            result = await service.keyword_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
+        return _paginated_response(result, page, page_size)
     except AppException:
         raise
     except HTTPException:
@@ -103,11 +127,12 @@ async def semantic_search(payload: SemanticSearchRequest, current_user: CurrentU
     try:
         service = _get_service()
         page, page_size = _page_args(payload)
+        filters = _search_filters(payload)
         try:
             result = await service.semantic_search(db=db, search_request=payload, user_id=current_user.sub)
         except TypeError:
-            result = await service.semantic_search(db=db, query=payload.query, page=page, page_size=page_size)
-        return _success_response(result, meta={"page": page, "page_size": page_size})
+            result = await service.semantic_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
+        return _paginated_response(result, page, page_size)
     except AppException:
         raise
     except HTTPException:
@@ -123,11 +148,12 @@ async def hybrid_search(payload: HybridSearchRequest, current_user: CurrentUser,
     try:
         service = _get_service()
         page, page_size = _page_args(payload)
+        filters = _search_filters(payload)
         try:
             result = await service.hybrid_search(db=db, search_request=payload, user_id=current_user.sub)
         except TypeError:
-            result = await service.hybrid_search(db=db, query=payload.query, page=page, page_size=page_size)
-        return _success_response(result, meta={"page": page, "page_size": page_size})
+            result = await service.hybrid_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
+        return _paginated_response(result, page, page_size)
     except AppException:
         raise
     except HTTPException:

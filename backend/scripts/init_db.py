@@ -57,9 +57,21 @@ async def patch_schema() -> None:
     """
     from sqlalchemy import text
 
+    from app.core.config import settings
+
     statements = (
         "ALTER TABLE sources ADD COLUMN IF NOT EXISTS domain VARCHAR(100)",
         "ALTER TABLE sources ALTER COLUMN country DROP NOT NULL",
+        # pgvector: enable the extension, then add the opportunity embedding column.
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        f"ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS embedding vector({settings.EMBEDDING_DIM})",
+        # pg_trgm: fuzzy/ranked keyword search (FR-SEARCH-001).
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+        "CREATE INDEX IF NOT EXISTS idx_opp_title_trgm ON opportunities USING gin (title gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS idx_opp_summary_trgm ON opportunities USING gin (ai_summary gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS idx_opp_inst_trgm ON opportunities USING gin (institution gin_trgm_ops)",
+        # HNSW cosine index for document-chunk semantic search (table made by create_all).
+        "CREATE INDEX IF NOT EXISTS idx_docemb_hnsw ON document_embeddings USING hnsw (embedding vector_cosine_ops)",
     )
     # Each statement gets its own transaction: a failure on Postgres aborts the
     # whole transaction, which would otherwise cascade to the next statement.

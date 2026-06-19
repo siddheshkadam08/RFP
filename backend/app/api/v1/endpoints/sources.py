@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.exceptions import AppException
+from app.core.geo import COUNTRY_REGIONS, SOURCE_COUNTRIES
 from app.core.security import TokenPayload, get_current_user, role_required
 from app.models.source import SOURCE_REGIONS, CrawlFrequency, CrawlStatus, Source, SourceDomain, SourceType
 from app.models.user import UserRole
@@ -171,8 +172,96 @@ async def list_source_options(current_user: CurrentUser) -> dict[str, Any]:
             "frequencies": [item.value for item in CrawlFrequency],
             "domains": [item.value for item in SourceDomain],
             "regions": list(SOURCE_REGIONS),
+            "countries": list(SOURCE_COUNTRIES),
+            # country -> region, so the form can auto-fill Region when a country is picked.
+            "country_regions": dict(COUNTRY_REGIONS),
         }
     )
+
+
+class DetectLocationRequest(BaseModel):
+    """Request body for URL-based country/region detection."""
+
+    url: str = Field(min_length=1, max_length=2048)
+
+
+@router.post("/detect-location", status_code=status.HTTP_200_OK)
+async def detect_location(payload: DetectLocationRequest, current_user: CurrentUser) -> dict[str, Any]:
+    """Detect a website's country and region from its URL (TLD, with AI fallback).
+
+    Returns {"country", "region", "method"}; any field may be null when undetermined.
+    """
+    from app.services.location_service import detect_location as _detect
+
+    try:
+        result = await _detect(payload.url)
+        return _success_response(result)
+    except Exception as exc:
+        logger.exception("Failed to detect location for %s", payload.url)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to detect location"
+        ) from exc
+
+
+@router.post("/crawl-all", status_code=status.HTTP_200_OK)
+async def crawl_all_sources(db: DBSession, current_user: AdminUser) -> dict[str, Any]:
+    """Crawl every active source now and persist any opportunities found (admin).
+
+    Runs inline (no Celery/Redis needed). Each source is isolated, so one failure
+    does not abort the batch.
+    """
+    from app.services.ingestion_service import ingest_source
+
+    try:
+        service = _get_service()
+        try:
+            result = await service.list_sources(db=db, page=1, page_size=100, user_id=current_user.sub)
+        except TypeError:
+            result = await service.list_sources(db=db, page=1, page_size=100)
+        items, _ = result if isinstance(result, tuple) else (result, None)
+
+        summaries = [await ingest_source(db, source) for source in items if getattr(source, "is_active", True)]
+        return _success_response(
+            {
+                "sources_crawled": len(summaries),
+                "documents_created": sum(item.get("documents_created", 0) for item in summaries),
+                "opportunities_created": sum(item.get("opportunities_created", 0) for item in summaries),
+                "results": summaries,
+            }
+        )
+    except AppException:
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to crawl all sources")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to crawl sources") from exc
+
+
+@router.post("/{source_id}/crawl", status_code=status.HTTP_200_OK)
+async def crawl_source(source_id: UUID, db: DBSession, current_user: AdminUser) -> dict[str, Any]:
+    """Crawl a single source now and persist any opportunity found (admin).
+
+    Runs inline (no Celery/Redis needed) so the caller gets the real result
+    (documents/opportunities created, relevance, score).
+    """
+    from app.services.ingestion_service import ingest_source
+
+    try:
+        service = _get_service()
+        if hasattr(service, "get_source_by_id"):
+            source = await service.get_source_by_id(db=db, source_id=source_id, user_id=current_user.sub)
+        else:
+            source = await service.get_source(db=db, source_id=source_id)
+        summary = await ingest_source(db, source)
+        return _success_response(summary)
+    except AppException:
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to crawl source %s", source_id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to crawl source") from exc
 
 
 @router.get("/{source_id}", status_code=status.HTTP_200_OK)

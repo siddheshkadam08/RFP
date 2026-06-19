@@ -11,7 +11,9 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = "RFPIntelligenceBot/1.0 (opportunity-scanner)"
+# Declared bot UA with contact — required by SEC.gov's fair-access policy (a generic
+# browser UA gets 403 from SEC). Browser-like spoofing helps a few sites but breaks more.
+_USER_AGENT = "RFPIntelligenceBot/1.0 (+mailto:admin@example.com)"
 
 
 @dataclass
@@ -36,6 +38,10 @@ def _extract_text_from_html(raw_html: str) -> tuple[str, str]:
 
     title = soup.title.get_text(strip=True) if soup.title else ""
 
+    def _clean(node) -> str:
+        raw = node.get_text(separator="\n", strip=True)
+        return "\n".join(line.strip() for line in raw.splitlines() if line.strip())
+
     # Try common main-content selectors first
     main = (
         soup.find("main")
@@ -44,12 +50,14 @@ def _extract_text_from_html(raw_html: str) -> tuple[str, str]:
         or soup.find("div", id="content")
         or soup.find("div", class_="content")
     )
-    container = main or soup.body or soup
-    text = container.get_text(separator="\n", strip=True)
+    text = _clean(main) if main else ""
+    body_text = _clean(soup.body or soup)
 
-    # Collapse excessive blank lines
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return title, "\n".join(lines)
+    # Many regulator pages put a near-empty <main> shell with the real content elsewhere;
+    # if the main region is thin, fall back to the fuller body text.
+    if len(text) < 200 and len(body_text) > len(text):
+        text = body_text
+    return title, text
 
 
 def _extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str]:

@@ -9,6 +9,7 @@ from sqlalchemy import JSON, Boolean, DateTime, Enum as SAEnum, Float, String, U
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.core.geo import SOURCE_REGIONS  # noqa: F401 - re-exported for the sources endpoint
 
 if TYPE_CHECKING:
     from app.models.document import Document
@@ -49,19 +50,9 @@ class SourceDomain(str, Enum):
     OTHER = "other"
 
 
-# Curated region list bound to the source form dropdown. No reference table is
-# maintained in Phase 1, so this constant is the single source of truth and is
-# exposed to the frontend via ``GET /sources/options``.
-SOURCE_REGIONS: list[str] = [
-    "North America",
-    "Latin America & Caribbean",
-    "Europe",
-    "Middle East & North Africa",
-    "Sub-Saharan Africa",
-    "Asia Pacific",
-    "South Asia",
-    "Global",
-]
+# SOURCE_REGIONS now lives in app.core.geo (alongside the country<->region data)
+# and is imported above so existing ``from app.models.source import SOURCE_REGIONS``
+# call sites keep working.
 
 
 class CrawlStatus(str, Enum):

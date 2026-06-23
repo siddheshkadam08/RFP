@@ -4,7 +4,8 @@ import { useEffect, useMemo, useState } from 'react';
 import Badge from '@/components/common/Badge';
 import EmptyState from '@/components/common/EmptyState';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
-import { get, getApiErrorMessage } from '@/services/api';
+import { getApiErrorMessage } from '@/services/api';
+import { getAlerts, markAlertRead, markAllAlertsRead } from '@/services/alerts';
 import type { Alert } from '@/utils/types';
 
 const AlertsPage = () => {
@@ -19,7 +20,7 @@ const AlertsPage = () => {
       setError('');
 
       try {
-        const response = await get<Alert[]>('/alerts/');
+        const response = await getAlerts();
         setAlerts(response);
       } catch (loadError) {
         setError(getApiErrorMessage(loadError, 'Unable to load alerts.'));
@@ -36,12 +37,24 @@ const AlertsPage = () => {
     [activeTab, alerts],
   );
 
-  const markAllRead = () => {
+  const markAllRead = async () => {
+    setError('');
     setAlerts((current) => current.map((alert) => ({ ...alert, is_read: true })));
+    try {
+      await markAllAlertsRead();
+    } catch (markError) {
+      setError(getApiErrorMessage(markError, 'Unable to mark all alerts as read.'));
+    }
   };
 
-  const markRead = (alertId: string) => {
+  const markRead = async (alertId: string) => {
+    setError('');
     setAlerts((current) => current.map((alert) => (alert.id === alertId ? { ...alert, is_read: true } : alert)));
+    try {
+      await markAlertRead(alertId, true);
+    } catch (markError) {
+      setError(getApiErrorMessage(markError, 'Unable to update the alert.'));
+    }
   };
 
   const getAlertIcon = (type: string) => {
@@ -87,7 +100,7 @@ const AlertsPage = () => {
 
           <button
             type="button"
-            onClick={markAllRead}
+            onClick={() => void markAllRead()}
             className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
           >
             <CheckCheck className="h-4 w-4" />
@@ -110,7 +123,9 @@ const AlertsPage = () => {
                 <button
                   key={alert.id}
                   type="button"
-                  onClick={() => markRead(alert.id)}
+                  onClick={() => {
+                    if (!alert.is_read) void markRead(alert.id);
+                  }}
                   className={[
                     'flex w-full items-start gap-4 rounded-2xl border px-5 py-4 text-left transition',
                     alert.is_read ? 'border-slate-200 bg-white' : 'border-blue-200 bg-blue-50/40',

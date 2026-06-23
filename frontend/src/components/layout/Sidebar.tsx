@@ -10,8 +10,10 @@ import {
   Target,
   X,
 } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 
+import { getUnreadCount, onAlertsChanged } from '@/services/alerts';
 import { useAuth } from '@/store/AuthContext';
 
 interface SidebarProps {
@@ -36,6 +38,23 @@ const Sidebar = ({ isOpen, onClose }: SidebarProps) => {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const { user, logout } = useAuth();
+  const [unreadAlerts, setUnreadAlerts] = useState(0);
+
+  const refreshUnread = useCallback(() => {
+    getUnreadCount()
+      .then((result) => setUnreadAlerts(result?.count ?? 0))
+      .catch(() => {
+        // badge is optional; ignore failures
+      });
+  }, []);
+
+  // Refresh the unread badge on mount, on route change, and whenever alerts are marked
+  // read elsewhere (e.g. on /alerts, where the route doesn't change).
+  useEffect(() => {
+    refreshUnread();
+  }, [pathname, refreshUnread]);
+
+  useEffect(() => onAlertsChanged(refreshUnread), [refreshUnread]);
 
   const filteredNavigation = navigation.filter((item) => !item.adminOnly || user?.role === 'admin');
   const initials = user?.full_name
@@ -106,6 +125,11 @@ const Sidebar = ({ isOpen, onClose }: SidebarProps) => {
               >
                 <Icon className={['h-5 w-5', active ? 'text-blue-600' : 'text-slate-400 group-hover:text-slate-700'].join(' ')} />
                 <span>{label}</span>
+                {label === 'Alerts' && unreadAlerts > 0 ? (
+                  <span className="ml-auto inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-rose-500 px-1.5 text-xs font-semibold text-white">
+                    {unreadAlerts > 99 ? '99+' : unreadAlerts}
+                  </span>
+                ) : null}
               </NavLink>
             );
           })}

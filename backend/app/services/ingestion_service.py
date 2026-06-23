@@ -13,23 +13,30 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import update
 
 from app.agents.pipeline import PipelineStage, run_intelligence_pipeline
+from app.core.config import settings
 from app.core.database import AsyncSession
 from app.models.document import Document, DocumentEmbedding, DocumentType, ProcessingStatus
 from app.models.opportunity import OpportunityCategory
 from app.models.source import CrawlStatus, Source
-from app.services import ai_service, document_service, opportunity_service
-from app.services.url_fetcher import fetch_url_content
+from app.services import ai_service, alert_service, crawler, document_service, opportunity_service
+from app.services.url_fetcher import FetchedContent, fetch_raw_text, fetch_url_content
 
 logger = logging.getLogger(__name__)
 
 # Cap text sent to the LLM to control token cost (mirrors the analyze endpoint).
 _MAX_CONTENT_CHARS = 15_000
 
-_DOC_TYPE_MAP = {"html": DocumentType.HTML, "pdf": DocumentType.PDF}
+_DOC_TYPE_MAP = {
+    "html": DocumentType.HTML,
+    "pdf": DocumentType.PDF,
+    "docx": DocumentType.DOCX,
+    "xlsx": DocumentType.XLSX,
+}
 
 
 def _now() -> datetime:
@@ -136,81 +143,36 @@ async def _embed_document(db: AsyncSession, document_id: Any, content_text: str)
     return created
 
 
-async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
-    """Fetch one source, run the AI pipeline, and persist a Document + Opportunity.
+async def _process_page(db: AsyncSession, source: Source, fetched: FetchedContent) -> dict[str, Any]:
+    """De-dupe, persist a Document, run the AI pipeline, and (if relevant) create an
+    Opportunity for a single fetched page/document. Never raises — returns a summary dict."""
+    page_url = fetched.url
 
-    Returns a summary dict (never raises): a single bad source must not abort a batch.
-    """
-    source_id = source.id
-    source_url = source.url
-    source_region = source.region
-
-    async def _mark_source(crawl_status: CrawlStatus) -> None:
-        await db.execute(
-            update(Source)
-            .where(Source.id == source_id)
-            .values(
-                last_crawl_at=_now(),
-                last_crawl_status=crawl_status,
-                # Reflect the latest crawl outcome so the dashboard's avg success rate is real.
-                success_rate=100.0 if crawl_status == CrawlStatus.SUCCESS else 0.0,
-            )
-        )
-        await db.commit()
-
-    # 1. Fetch ---------------------------------------------------------------
-    try:
-        fetched = await fetch_url_content(source_url)
-    except Exception as exc:  # noqa: BLE001 - report, do not crash the batch
-        logger.warning("Crawl fetch failed for source %s (%s): %s", source_id, source_url, exc)
-        await _mark_source(CrawlStatus.FAILED)
-        return {
-            "source_id": str(source_id),
-            "status": "failed",
-            "error": str(exc),
-            "documents_created": 0,
-            "opportunities_created": 0,
-        }
-
-    # 2. De-dupe by content hash --------------------------------------------
     existing = await document_service.get_document_by_hash(db, fetched.content_hash)
     if existing is not None:
-        await _mark_source(CrawlStatus.SUCCESS)
-        return {
-            "source_id": str(source_id),
-            "status": "skipped",
-            "reason": "duplicate",
-            "documents_created": 0,
-            "opportunities_created": 0,
-        }
+        return {"status": "skipped", "reason": "duplicate", "documents_created": 0,
+                "opportunities_created": 0, "url": page_url}
 
     document_id = None
     try:
-        # 3. Persist the raw document (PROCESSING) --------------------------
         document = await document_service.create_document(
             db,
             {
-                "source_id": source_id,
-                "url": source_url,
+                "source_id": source.id,
+                "url": page_url,
                 "title": fetched.title,
                 "content_text": fetched.text,
                 "content_hash": fetched.content_hash,
                 "document_type": _to_document_type(fetched.content_type),
                 "language": "en",
                 "processing_status": ProcessingStatus.PROCESSING,
-                "metadata_json": {
-                    "content_type": fetched.content_type,
-                    "content_length": fetched.content_length,
-                },
+                "metadata_json": {"content_type": fetched.content_type, "content_length": fetched.content_length},
             },
         )
         document_id = document.id
 
-        # 4. Run the AI pipeline -------------------------------------------
         content = fetched.text[:_MAX_CONTENT_CHARS]
-        results = await run_intelligence_pipeline(
-            content, {"source_id": str(source_id), "url": source_url}
-        )
+        results = await run_intelligence_pipeline(content, {"source_id": str(source.id), "url": page_url})
         by_stage = {result.stage: result.data for result in results}
         relevance = by_stage.get(PipelineStage.RELEVANCE_CHECK, {})
         is_relevant = bool(relevance.get("relevant", False))
@@ -220,7 +182,6 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
         opportunity_id = None
         score = 0
 
-        # 5. If relevant, build + persist the opportunity ------------------
         if is_relevant:
             extracted = by_stage.get(PipelineStage.EXTRACTION, {})
             classification = by_stage.get(PipelineStage.CLASSIFICATION, {})
@@ -229,15 +190,13 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
             standards = extracted.get("standards")
             breakdown = scoring.get("breakdown")
             title = _coalesce_title(extracted.get("title"), fetched.title)
-            # ai_summary is injected into the extraction dict by the pipeline.
             ai_summary = extracted.get("ai_summary") or ""
 
-            # Semantic-search embedding (best-effort; null if the resource is unavailable).
             embedding = None
             try:
                 embedding = await ai_service.get_embedding(f"{title}\n{ai_summary}".strip())
             except Exception as exc:  # noqa: BLE001 - embedding is optional
-                logger.warning("Embedding skipped for source %s: %s", source_id, exc)
+                logger.warning("Embedding skipped for %s: %s", page_url, exc)
 
             opportunity = await opportunity_service.create_opportunity(
                 db,
@@ -246,7 +205,7 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
                     "title": title,
                     "institution": (extracted.get("institution") or "Unknown")[:255],
                     "country": (extracted.get("country") or "Unknown")[:100],
-                    "region": source_region,  # pipeline has no region; use the source's
+                    "region": source.region,  # pipeline has no region; use the source's
                     "category": _to_category(classification.get("category")),
                     "standards": standards if isinstance(standards, list) else [],
                     "budget": _to_budget(extracted.get("budget")),
@@ -255,60 +214,158 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
                     "score": score,
                     "score_breakdown": breakdown if isinstance(breakdown, dict) else {},
                     "ai_summary": ai_summary,
-                    # No reasoning field in the pipeline; use the relevance reason.
                     "ai_reasoning": relevance.get("reason") or "",
-                    "source_url": source_url,
+                    "source_url": page_url,  # link the opportunity to its own page, not the listing
                     "embedding": embedding,
                 },
             )
             opportunities_created = 1
             opportunity_id = str(opportunity.id)
 
-        # 6. Finalize the document + source --------------------------------
         await db.execute(
             update(Document)
             .where(Document.id == document_id)
-            .values(
-                is_relevant=is_relevant,
-                relevance_confidence=confidence,
-                processing_status=ProcessingStatus.COMPLETED,
-            )
+            .values(is_relevant=is_relevant, relevance_confidence=confidence,
+                    processing_status=ProcessingStatus.COMPLETED)
         )
         await db.commit()
-        await _mark_source(CrawlStatus.SUCCESS)
 
-        # 7. Embed the document body into chunks for semantic doc-corpus search.
         await _embed_document(db, document_id, fetched.text)
+        if opportunity_id:
+            await alert_service.emit_opportunity_alerts(db, opportunity_id)
 
-        return {
-            "source_id": str(source_id),
-            "status": "ok",
-            "relevant": is_relevant,
-            "documents_created": 1,
-            "opportunities_created": opportunities_created,
-            "opportunity_id": opportunity_id,
-            "score": score,
-            "reason": relevance.get("reason", ""),
-        }
+        return {"status": "ok", "relevant": is_relevant, "documents_created": 1,
+                "opportunities_created": opportunities_created, "opportunity_id": opportunity_id,
+                "score": score, "reason": relevance.get("reason", ""), "url": page_url}
 
-    except Exception as exc:  # noqa: BLE001 - report, do not crash the batch
+    except Exception as exc:  # noqa: BLE001 - one bad page must not abort the crawl
         await db.rollback()
-        logger.exception("Crawl processing failed for source %s", source_id)
+        logger.exception("Page processing failed for %s", page_url)
         if document_id is not None:
             try:
                 await db.execute(
-                    update(Document)
-                    .where(Document.id == document_id)
-                    .values(processing_status=ProcessingStatus.FAILED)
+                    update(Document).where(Document.id == document_id).values(processing_status=ProcessingStatus.FAILED)
                 )
                 await db.commit()
             except Exception:  # noqa: BLE001
                 await db.rollback()
+        return {"status": "failed", "error": str(exc), "documents_created": 0,
+                "opportunities_created": 0, "url": page_url}
+
+
+async def _sitemap_candidates(base_url: str) -> list:
+    """Discover candidates from robots.txt `Sitemap:` entries / `/sitemap.xml` (1 index level)."""
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    sitemap_urls: list[str] = []
+    robots = await fetch_raw_text(f"{origin}/robots.txt")
+    if robots:
+        sitemap_urls.extend(crawler.sitemaps_from_robots(robots))
+    sitemap_urls.append(f"{origin}/sitemap.xml")
+
+    for sitemap_url in sitemap_urls[:3]:
+        xml = await fetch_raw_text(sitemap_url)
+        if not xml:
+            continue
+        is_index, locs = crawler.parse_sitemap(xml)
+        if is_index and locs:  # sitemap-index -> resolve the first child sitemap
+            child = await fetch_raw_text(locs[0])
+            if child:
+                _, locs = crawler.parse_sitemap(child)
+        candidates = crawler.candidates_from_locs(locs, base_url)
+        if candidates:
+            return candidates
+    return []
+
+
+async def _discover_candidates(source: Source, fetched: FetchedContent) -> list:
+    """Pick crawl candidates: on-page links / feed entries, with feed- and sitemap-discovery fallbacks."""
+    candidates = crawler.select_candidates(source, fetched)
+    if not candidates and fetched.content_type == "html" and fetched.raw_html:
+        feed_url = crawler.discover_feed(fetched.url, fetched.raw_html)
+        if feed_url:
+            try:
+                feed_fetched = await fetch_url_content(feed_url)
+                candidates = crawler.parse_feed(feed_fetched.raw_html or feed_fetched.text)
+            except Exception as exc:  # noqa: BLE001 - feed fallback is best-effort
+                logger.warning("Feed fetch failed (%s): %s", feed_url, exc)
+    if not candidates and fetched.content_type == "html":
+        candidates = await _sitemap_candidates(fetched.url)
+    return candidates
+
+
+async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
+    """Crawl one source: fetch the root, then either follow relevance-gated child links
+    (listing/feed) or process the page directly (leaf/document). Never raises."""
+    source_id = source.id
+    source_url = source.url
+
+    async def _mark_source(crawl_status: CrawlStatus) -> None:
+        await db.execute(
+            update(Source)
+            .where(Source.id == source_id)
+            .values(
+                last_crawl_at=_now(),
+                last_crawl_status=crawl_status,
+                success_rate=100.0 if crawl_status == CrawlStatus.SUCCESS else 0.0,
+            )
+        )
+        await db.commit()
+
+    # 1. Fetch the root (best-effort) ---------------------------------------
+    try:
+        fetched = await fetch_url_content(source_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Crawl fetch failed for source %s (%s): %s", source_id, source_url, exc)
         await _mark_source(CrawlStatus.FAILED)
+        await alert_service.emit_crawl_failure_alert(db, source_url, exc)
+        return {"source_id": str(source_id), "status": "failed", "error": str(exc),
+                "documents_created": 0, "opportunities_created": 0}
+
+    # 2. Discover candidate links / feed entries ----------------------------
+    candidates = await _discover_candidates(source, fetched) if settings.CRAWL_FOLLOW_LINKS else []
+
+    # 3a. Listing/feed page: relevance-gate the titles, then follow the winners ----
+    if candidates:
+        titles = [c.title for c in candidates]
+        try:
+            mask = await ai_service.filter_relevant_titles(titles)
+        except Exception as exc:  # noqa: BLE001 - if the gate fails, don't drop everything
+            logger.warning("Title gate failed, following all candidates: %s", exc)
+            mask = [True] * len(titles)
+        relevant = [c for c, keep in zip(candidates, mask) if keep]
+        skipped_irrelevant = len(candidates) - len(relevant)
+        relevant = relevant[: settings.CRAWL_MAX_PAGES]
+        logger.info(
+            "Source %s: %s candidates -> %s relevant (skipped %s), following %s",
+            source_id, len(candidates), len(candidates) - skipped_irrelevant, skipped_irrelevant, len(relevant),
+        )
+
+        page_results: list[dict[str, Any]] = []
+        for candidate in relevant:
+            try:
+                child = await fetch_url_content(candidate.url)
+            except Exception as exc:  # noqa: BLE001 - skip a bad child link
+                logger.warning("Child fetch failed (%s): %s", candidate.url, exc)
+                continue
+            page_results.append(await _process_page(db, source, child))
+
+        await _mark_source(CrawlStatus.SUCCESS)
         return {
             "source_id": str(source_id),
-            "status": "failed",
-            "error": str(exc),
-            "documents_created": 0,
-            "opportunities_created": 0,
+            "status": "ok",
+            "mode": "crawl",
+            "candidates": len(candidates),
+            "skipped_irrelevant": skipped_irrelevant,
+            "pages_followed": len(page_results),
+            "documents_created": sum(r.get("documents_created", 0) for r in page_results),
+            "opportunities_created": sum(r.get("opportunities_created", 0) for r in page_results),
+            "results": page_results,
         }
+
+    # 3b. Leaf/detail page or following disabled: process the page itself ----
+    result = await _process_page(db, source, fetched)
+    await _mark_source(CrawlStatus.SUCCESS if result.get("status") != "failed" else CrawlStatus.FAILED)
+    result["source_id"] = str(source_id)
+    result.setdefault("mode", "single")
+    return result

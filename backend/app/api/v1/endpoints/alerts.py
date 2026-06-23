@@ -13,6 +13,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.exceptions import AppException
 from app.core.security import TokenPayload, get_current_user
+from app.models.alert import Alert
+
+_ALERT_TITLES = {
+    "new_opportunity": "New opportunity",
+    "high_priority": "High-priority opportunity",
+    "deadline_approaching": "Deadline approaching",
+    "region_trend": "Regional trend",
+    "score_spike": "Score spike",
+    "crawl_failure": "Crawl failure",
+}
 
 try:
     from app.schemas.alert import AlertUpdate as AlertStatusUpdateRequest
@@ -51,6 +61,28 @@ def _get_service() -> Any:
     return alert_service
 
 
+def _enum(value: Any) -> Any:
+    return value.value if hasattr(value, "value") else value
+
+
+def _serialize_alert(alert: Any) -> Any:
+    """Convert an Alert ORM row into the dict the frontend expects (and avoid the
+    raw-ORM Pydantic 500). Non-ORM values pass through unchanged."""
+    if not isinstance(alert, Alert):
+        return alert
+    alert_type = _enum(alert.alert_type)
+    return {
+        "id": str(alert.id),
+        "type": alert_type,
+        "title": _ALERT_TITLES.get(alert_type, str(alert_type).replace("_", " ").title()),
+        "message": alert.message,
+        "severity": _enum(alert.severity),
+        "opportunity_id": str(alert.opportunity_id) if alert.opportunity_id else None,
+        "is_read": alert.is_read,
+        "created_at": alert.created_at.isoformat() if alert.created_at else None,
+    }
+
+
 @router.get("/", status_code=status.HTTP_200_OK)
 async def list_alerts(
     current_user: CurrentUser,
@@ -79,6 +111,7 @@ async def list_alerts(
                 page_size=page_size,
             )
         items, total = result if isinstance(result, tuple) else (result, None)
+        items = [_serialize_alert(item) for item in items]
         return _success_response(items, meta={"page": page, "page_size": page_size, "unread": unread, "total": total})
     except AppException:
         raise
@@ -87,6 +120,22 @@ async def list_alerts(
     except Exception as exc:
         logger.exception("Failed to list alerts")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list alerts") from exc
+
+
+@router.get("/unread-count", status_code=status.HTTP_200_OK)
+async def unread_count(current_user: CurrentUser, db: DBSession) -> dict[str, Any]:
+    """Return the count of unread alerts for the sidebar badge."""
+    try:
+        service = _get_service()
+        count = await service.unread_count(db=db, user_id=current_user.sub)
+        return _success_response({"count": int(count)})
+    except AppException:
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to count unread alerts")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to count unread alerts") from exc
 
 
 @router.patch("/{alert_id}", status_code=status.HTTP_200_OK)
@@ -108,7 +157,7 @@ async def update_alert(
             )
         except (AttributeError, TypeError):
             result = await service.mark_alert_read(db=db, alert_id=alert_id, is_read=payload.is_read)
-        return _success_response(result)
+        return _success_response(_serialize_alert(result))
     except AppException:
         raise
     except HTTPException:

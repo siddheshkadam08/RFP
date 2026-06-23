@@ -90,10 +90,12 @@ export interface Report {
   type: 'weekly' | 'monthly' | 'custom' | string;
   status: string;
   parameters?: Record<string, unknown> | null;
+  summary?: string | null;
   file_url?: string | null;
+  pdf_url?: string | null;
   generated_by?: string | null;
   created_at: string;
-  updated_at: string;
+  updated_at?: string;
   completed_at?: string | null;
 }
 

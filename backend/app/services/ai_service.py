@@ -15,6 +15,7 @@ from app.agents.prompts import (
     RELEVANCE_PROMPT,
     SCORING_PROMPT,
     SUMMARIZE_PROMPT,
+    TITLE_RELEVANCE_PROMPT,
 )
 from app.core.config import settings
 from app.core.exceptions import AIServiceException
@@ -361,6 +362,46 @@ async def score_opportunity(opportunity_data: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("Opportunity scoring fallback used: %s", exc)
         return fallback
+
+
+_TITLE_KEYWORDS = (
+    "suptech", "regtech", "xbrl", "sdmx", "iso 20022", "iso20022", "dpm", "supervis", "regulat",
+    "report", "taxonomy", "tender", "procure", "rfp", "compliance", "deposit", "disclosure",
+    "data collection", "filing", "submission", "central bank", "consultation",
+)
+
+
+def _title_keyword_match(title: str) -> bool:
+    lowered = (title or "").lower()
+    return any(keyword in lowered for keyword in _TITLE_KEYWORDS)
+
+
+async def filter_relevant_titles(titles: list[str]) -> list[bool]:
+    """Batched relevance triage over link titles (before fetching each full document).
+
+    Returns one bool per input title. Falls back to a keyword heuristic if the LLM call fails.
+    """
+    if not titles:
+        return []
+    numbered = "\n".join(f"{index}. {title}" for index, title in enumerate(titles))
+    try:
+        result = await _json_completion(
+            [
+                {"role": "system", "content": TITLE_RELEVANCE_PROMPT.replace("{titles}", "").strip()},
+                {"role": "user", "content": numbered},
+            ]
+        )
+        raw_indices = result.get("relevant_indices", []) if isinstance(result, dict) else []
+        keep: set[int] = set()
+        for value in raw_indices:
+            try:
+                keep.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return [index in keep for index in range(len(titles))]
+    except Exception as exc:  # noqa: BLE001 - keyword fallback
+        logger.warning("Title relevance gate fell back to keywords: %s", exc)
+        return [_title_keyword_match(title) for title in titles]
 
 
 def _context_citations(context: list[dict[str, Any]] | None) -> list[dict[str, Any]]:

@@ -51,3 +51,6 @@ htmlcov/
 # Temp
 tmp/
 temp/
+
+# Generated report files (.xlsx) written by the report service
+backend/storage/

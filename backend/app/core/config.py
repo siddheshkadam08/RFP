@@ -45,6 +45,18 @@ class Settings(BaseSettings):
     AZURE_OPENAI_EMBEDDING_API_VERSION: str = ""
     EMBEDDING_DIM: int = 1536
 
+    # Where generated report files (.xlsx) are written. Relative paths resolve against the
+    # backend working directory; the spec's external-drive STORAGE_ROOT can be set here later.
+    REPORTS_DIR: str = "storage/reports"
+
+    # Crawler: relevance-gated, bounded, depth-1 link-following.
+    CRAWL_FOLLOW_LINKS: bool = True
+    CRAWL_MAX_PAGES: int = 12  # max relevant child pages fetched per source
+    CRAWL_MAX_LINK_CANDIDATES: int = 60  # max links/feed entries examined before the title gate
+    CRAWL_MAX_BYTES: int = 10_000_000  # skip responses larger than this
+    CRAWL_RENDER_JS: bool = True  # use Playwright to render thin/JS-only pages
+    CRAWL_THIN_TEXT_THRESHOLD: int = 300  # below this many chars, try a JS render
+
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 
     SMTP_HOST: str = "localhost"

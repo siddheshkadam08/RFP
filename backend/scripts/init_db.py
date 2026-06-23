@@ -72,6 +72,8 @@ async def patch_schema() -> None:
         "CREATE INDEX IF NOT EXISTS idx_opp_inst_trgm ON opportunities USING gin (institution gin_trgm_ops)",
         # HNSW cosine index for document-chunk semantic search (table made by create_all).
         "CREATE INDEX IF NOT EXISTS idx_docemb_hnsw ON document_embeddings USING hnsw (embedding vector_cosine_ops)",
+        # New alert type for crawl-failure notifications (DB enum stores member names).
+        "ALTER TYPE alert_type ADD VALUE IF NOT EXISTS 'CRAWL_FAILURE'",
     )
     # Each statement gets its own transaction: a failure on Postgres aborts the
     # whole transaction, which would otherwise cascade to the next statement.

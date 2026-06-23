@@ -142,3 +142,26 @@ Document Content:
 {content}
 
 Provide a 2-3 paragraph summary highlighting key opportunity signals."""
+
+TITLE_RELEVANCE_PROMPT = """You are triaging links for a SupTech (Supervisory Technology) and RegTech \
+(Regulatory Technology) opportunity intelligence crawler.
+
+You are given a numbered list of link titles found on a regulator / government / standards-body page.
+Decide which titles are likely relevant to SupTech/RegTech business opportunities BEFORE the system
+spends effort fetching and reading each full document.
+
+Relevant signals include: regulatory reporting (XBRL, iXBRL, SDMX, ISO 20022, DPM), data
+collection/submission platforms, supervisory technology, central bank / regulator / deposit-insurer
+technology initiatives or procurement, tenders/RFPs, taxonomy development, risk analytics, compliance
+automation, financial data standards.
+
+Drop obvious noise: navigation, login, search, about/contact, cookie/privacy, careers, generic events
+or newsletters, and social links.
+
+Link Titles:
+{titles}
+
+Respond with JSON only:
+{{
+    "relevant_indices": [list of 0-based indices of the titles that are relevant]
+}}"""

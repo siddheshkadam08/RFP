@@ -4,42 +4,64 @@ import { useEffect, useMemo, useState } from 'react';
 import Badge from '@/components/common/Badge';
 import EmptyState from '@/components/common/EmptyState';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
-import { get, getApiErrorMessage, post } from '@/services/api';
+import { getApiErrorMessage } from '@/services/api';
+import { getOpportunityOptions, type OpportunityOptions } from '@/services/opportunities';
+import { downloadReport, generateReport, listReports } from '@/services/reports';
 import { useAuth } from '@/store/AuthContext';
 import type { Report } from '@/utils/types';
 
+const emptyOptions: OpportunityOptions = { categories: [], statuses: [], regions: [], countries: [], standards: [] };
+
+type ReportType = 'weekly' | 'monthly' | 'custom';
+
 const ReportsPage = () => {
   const { user } = useAuth();
-  const [reportType, setReportType] = useState<'weekly' | 'monthly' | 'custom'>('weekly');
+  const [reportType, setReportType] = useState<ReportType>('weekly');
   const [reports, setReports] = useState<Report[]>([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
 
+  const [options, setOptions] = useState<OpportunityOptions>(emptyOptions);
+  const [region, setRegion] = useState('');
+  const [category, setCategory] = useState('');
+  const [scoreMin, setScoreMin] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
   useEffect(() => {
-    const loadReports = async () => {
+    const load = async () => {
       setLoading(true);
       setError('');
-
       try {
-        const response = await get<Report[]>('/reports/');
-        setReports(response);
+        const [reportList, opts] = await Promise.all([listReports(), getOpportunityOptions().catch(() => emptyOptions)]);
+        setReports(reportList);
+        setOptions(opts);
       } catch (loadError) {
         setError(getApiErrorMessage(loadError, 'Unable to load reports.'));
       } finally {
         setLoading(false);
       }
     };
-
-    void loadReports();
+    void load();
   }, []);
+
+  const buildParameters = (): Record<string, unknown> => {
+    if (reportType !== 'custom') return {};
+    const params: Record<string, unknown> = {};
+    if (region) params.regions = [region];
+    if (category) params.categories = [category];
+    if (scoreMin) params.score_min = Number(scoreMin);
+    if (dateFrom) params.date_from = dateFrom;
+    if (dateTo) params.date_to = dateTo;
+    return params;
+  };
 
   const handleGenerate = async () => {
     setSubmitting(true);
     setError('');
-
     try {
-      const generatedReport = await post<Report>('/reports/generate', { type: reportType, parameters: {} });
+      const generatedReport = await generateReport(reportType, buildParameters());
       setReports((current) => [generatedReport, ...current]);
     } catch (generateError) {
       setError(getApiErrorMessage(generateError, 'Unable to generate a report.'));
@@ -48,11 +70,21 @@ const ReportsPage = () => {
     }
   };
 
+  const handleDownload = async (report: Report, format: 'xlsx' | 'pdf' = 'xlsx') => {
+    setError('');
+    try {
+      const base = (report.title ?? report.type).toString().replace(/\s+/g, '_');
+      await downloadReport(report.id, `${base}.${format}`, format);
+    } catch (downloadError) {
+      setError(getApiErrorMessage(downloadError, 'Unable to download the report.'));
+    }
+  };
+
   const selectedReport = useMemo(() => reports[0], [reports]);
   const getStatusVariant = (status: string) => {
     if (status === 'completed') return 'success';
     if (status === 'failed') return 'danger';
-    if (status === 'running') return 'info';
+    if (status === 'generating' || status === 'running') return 'info';
     return 'warning';
   };
 
@@ -62,13 +94,13 @@ const ReportsPage = () => {
         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <h1 className="text-xl font-semibold text-slate-900">Reports</h1>
-            <p className="text-sm text-slate-500">Generate recurring intelligence packs for leadership and pursuit teams.</p>
+            <p className="text-sm text-slate-500">Generate recurring intelligence packs (Excel + PDF) for leadership and pursuit teams.</p>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
             <select
               value={reportType}
-              onChange={(event) => setReportType(event.target.value as 'weekly' | 'monthly' | 'custom')}
+              onChange={(event) => setReportType(event.target.value as ReportType)}
               className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-blue-500"
             >
               <option value="weekly">Weekly</option>
@@ -86,6 +118,67 @@ const ReportsPage = () => {
             </button>
           </div>
         </div>
+
+        {reportType === 'custom' ? (
+          <div className="mt-5 grid grid-cols-1 gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:grid-cols-2 lg:grid-cols-3">
+            <label className="text-xs font-medium text-slate-500">
+              Region
+              <select
+                value={region}
+                onChange={(event) => setRegion(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-500"
+              >
+                <option value="">All regions</option>
+                {options.regions.map((value) => (
+                  <option key={value} value={value}>{value}</option>
+                ))}
+              </select>
+            </label>
+            <label className="text-xs font-medium text-slate-500">
+              Category
+              <select
+                value={category}
+                onChange={(event) => setCategory(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-500"
+              >
+                <option value="">All categories</option>
+                {options.categories.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="text-xs font-medium text-slate-500">
+              Min score
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={scoreMin}
+                onChange={(event) => setScoreMin(event.target.value)}
+                placeholder="0"
+                className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-500"
+              />
+            </label>
+            <label className="text-xs font-medium text-slate-500">
+              Date from
+              <input
+                type="date"
+                value={dateFrom}
+                onChange={(event) => setDateFrom(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-500"
+              />
+            </label>
+            <label className="text-xs font-medium text-slate-500">
+              Date to
+              <input
+                type="date"
+                value={dateTo}
+                onChange={(event) => setDateTo(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-500"
+              />
+            </label>
+          </div>
+        ) : null}
 
         {error ? <div className="mt-5 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
 
@@ -115,14 +208,26 @@ const ReportsPage = () => {
                       <td className="py-4 pr-4">{report.generated_by ?? user?.full_name ?? 'System'}</td>
                       <td className="py-4 pr-4">{new Date(report.created_at).toLocaleString()}</td>
                       <td className="py-4">
-                        <button
-                          type="button"
-                          disabled={!report.file_url}
-                          className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          <Download className="h-4 w-4" />
-                          Download
-                        </button>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            disabled={!report.file_url}
+                            onClick={() => void handleDownload(report, 'xlsx')}
+                            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <Download className="h-4 w-4" />
+                            Excel
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!report.pdf_url}
+                            onClick={() => void handleDownload(report, 'pdf')}
+                            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <Download className="h-4 w-4" />
+                            PDF
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -139,10 +244,35 @@ const ReportsPage = () => {
         <h2 className="text-lg font-semibold text-slate-900">Report Preview</h2>
         {selectedReport ? (
           <div className="mt-5 rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-5">
-            <p className="text-sm font-semibold text-slate-900">{selectedReport.title ?? `${selectedReport.type} opportunity intelligence`}</p>
-            <p className="mt-2 text-sm leading-7 text-slate-600">
-              Preview content will display executive summaries, priority pursuits, market shifts, and source health once report rendering is connected.
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-sm font-semibold text-slate-900">{selectedReport.title ?? `${selectedReport.type} opportunity intelligence`}</p>
+              <Badge text={selectedReport.status} variant={getStatusVariant(selectedReport.status)} size="sm" />
+            </div>
+            <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-600">
+              {selectedReport.summary?.trim() || 'The executive summary will appear here once the report finishes generating.'}
             </p>
+            {selectedReport.file_url ? (
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleDownload(selectedReport, 'xlsx')}
+                  className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
+                >
+                  <Download className="h-4 w-4" />
+                  Excel
+                </button>
+                {selectedReport.pdf_url ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleDownload(selectedReport, 'pdf')}
+                    className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+                  >
+                    <Download className="h-4 w-4" />
+                    PDF
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         ) : (
           <EmptyState icon={FileText} title="Preview unavailable" description="Select or generate a report to display the preview panel." />

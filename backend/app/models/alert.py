@@ -21,6 +21,7 @@ class AlertType(str, Enum):
     DEADLINE_APPROACHING = "deadline_approaching"
     REGION_TREND = "region_trend"
     SCORE_SPIKE = "score_spike"
+    CRAWL_FAILURE = "crawl_failure"
 
 
 class AlertSeverity(str, Enum):

@@ -13,7 +13,9 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        // Use 127.0.0.1 (not localhost): uvicorn binds IPv4 only, but Node resolves
+        // "localhost" to IPv6 ::1 first on Windows, which fails with ECONNREFUSED.
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
     },

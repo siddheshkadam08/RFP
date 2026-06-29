@@ -9,12 +9,13 @@ from sqlalchemy import func, or_, select, update
 
 from app.core.database import AsyncSession
 from app.core.exceptions import NotFoundException
+from app.core.scoring import SCORE_HIGH_MIN, SCORE_MEDIUM_MIN
 from app.models.alert import Alert, AlertSeverity, AlertType
 from app.models.opportunity import Opportunity
 
 logger = logging.getLogger(__name__)
 
-_HIGH_SCORE = 80  # spec scoring threshold: >=80 High
+_HIGH_SCORE = SCORE_HIGH_MIN  # spec scoring threshold: >=80 High (single source: core.scoring)
 _DEADLINE_WINDOW_DAYS = 14  # spec deadline alert windows: 14 / 7 / 1 days
 
 
@@ -30,7 +31,7 @@ def _visible(user_uuid: UUID):
 def _severity_for_score(score: int) -> AlertSeverity:
     if score >= _HIGH_SCORE:
         return AlertSeverity.HIGH
-    if score >= 50:
+    if score >= SCORE_MEDIUM_MIN:
         return AlertSeverity.MEDIUM
     return AlertSeverity.LOW
 

@@ -40,6 +40,33 @@ async def log_action(
         raise
 
 
+async def log_action_safe(
+    db: AsyncSession,
+    *,
+    action: str,
+    resource_type: str,
+    user_id: Any | None = None,
+    resource_id: str | None = None,
+    details: dict[str, Any] | None = None,
+    ip_address: str | None = None,
+) -> None:
+    """Best-effort audit write (FR-AUTH-005): never raises, so it can't break the audited request.
+
+    Call this *after* the audited mutation has committed — it runs as its own transaction, so a
+    failed audit insert rolls back only itself and is downgraded to a warning.
+    """
+    try:
+        await log_action(db, user_id, action, resource_type, resource_id, details, ip_address)
+    except Exception:  # noqa: BLE001 - auditing must not break the main flow
+        logger.warning("Audit log write failed (action=%s resource=%s)", action, resource_type)
+
+
+def client_ip(request: Any) -> str | None:
+    """Best-effort client IP from a FastAPI/Starlette request, for audit records."""
+    client = getattr(request, "client", None)
+    return getattr(client, "host", None) if client is not None else None
+
+
 async def list_audit_logs(
     db: AsyncSession,
     page: int,

@@ -38,6 +38,11 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=3, minute=0, day_of_week=1),  # Monday 3 AM
         "args": ("weekly",),
     },
+    "crawl-monthly-sources": {
+        "task": "app.tasks.crawl_sources",
+        "schedule": crontab(hour=4, minute=0, day_of_month=1),  # 1st of month, 4 AM
+        "args": ("monthly",),
+    },
     "generate-weekly-report": {
         "task": "app.tasks.generate_weekly_report",
         "schedule": crontab(hour=6, minute=0, day_of_week=1),  # Monday 6 AM

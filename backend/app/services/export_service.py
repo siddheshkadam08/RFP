@@ -21,6 +21,8 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.core.scoring import score_band
+
 _HEADERS = [
     "ID", "Title", "Country", "Region", "Institution",
     "Category", "Score", "Status", "Budget", "Deadline",
@@ -31,10 +33,11 @@ _HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
 _TITLE_FONT = Font(bold=True, size=16, color="1F4E78")
 _LINK_FONT = Font(color="0563C1", underline="single")
-# Score band fills: >=71 green, 41-70 amber, <41 grey (matches getScoreVariant / dashboard).
+# Score band fills (spec doc04 §14): >=80 green High, 50-79 amber Medium, <50 grey Low.
 _GREEN = PatternFill("solid", fgColor="C6EFCE")
 _AMBER = PatternFill("solid", fgColor="FFEB9C")
 _GREY = PatternFill("solid", fgColor="E7E6E6")
+_BAND_FILL = {"high": _GREEN, "medium": _AMBER, "low": _GREY}
 
 
 def _enum(value: Any) -> Any:
@@ -44,11 +47,7 @@ def _enum(value: Any) -> Any:
 def _score_fill(score: Any) -> PatternFill | None:
     if score is None or score == "":
         return None
-    if score >= 71:
-        return _GREEN
-    if score >= 41:
-        return _AMBER
-    return _GREY
+    return _BAND_FILL[score_band(score)]
 
 
 def _style_header_row(sheet: Worksheet, ncols: int) -> None:

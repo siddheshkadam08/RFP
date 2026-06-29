@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, literal_column, select
 
 from app.core.database import AsyncSession
+from app.core.scoring import SCORE_HIGH_MIN
 from app.models.opportunity import Opportunity, OpportunityStatus
 from app.models.source import Source
 
@@ -19,7 +20,7 @@ async def get_summary(db: AsyncSession) -> dict[str, float | int]:
 
     total_opportunities = int(await db.scalar(select(func.count()).select_from(Opportunity)) or 0)
     high_priority = int(
-        await db.scalar(select(func.count()).select_from(Opportunity).where(Opportunity.score >= 71)) or 0
+        await db.scalar(select(func.count()).select_from(Opportunity).where(Opportunity.score >= SCORE_HIGH_MIN)) or 0
     )
     new_this_week = int(
         await db.scalar(

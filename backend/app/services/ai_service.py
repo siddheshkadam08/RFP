@@ -143,10 +143,24 @@ def _extract_json(text: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise
+        pass
+    # Strip markdown code fences (```json ... ```) that models often wrap JSON in.
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.IGNORECASE)
+    candidates = [cleaned]
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            # Drop trailing commas before a closing } or ] and retry once.
+            repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                continue
+    raise json.JSONDecodeError("No parseable JSON object found", text, 0)
 
 
 async def _json_completion(messages: list[dict[str, Any]], model: str = "small") -> dict[str, Any]:
@@ -210,6 +224,8 @@ def _default_score_breakdown(opportunity_data: dict[str, Any]) -> dict[str, int]
         except ValueError:
             deadline = None
     if isinstance(deadline, datetime):
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
         days_remaining = (deadline - datetime.now(timezone.utc)).days
         if days_remaining >= 90:
             timeline = 85

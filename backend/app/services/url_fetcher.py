@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Declared bot UA with contact — required by SEC.gov's fair-access policy (a generic
 # browser UA gets 403 from SEC). Browser-like spoofing helps a few sites but breaks more.
-_USER_AGENT = "RFPIntelligenceBot/1.0 (+mailto:admin@example.com)"
+# Public so the robots.txt gate matches its product token against ``User-agent:`` lines.
+USER_AGENT = "RFPIntelligenceBot/1.0 (+mailto:admin@example.com)"
+_USER_AGENT = USER_AGENT  # internal alias kept for existing references
 # Browser-like headers used only as a retry when the declared bot UA is refused
 # (401/403/429). Some sites gate non-browser UAs; we try this before a full JS render.
 _BROWSER_HEADERS = {
@@ -378,11 +380,11 @@ async def _http_get(url: str, timeout: float, headers: dict | None = None) -> ht
                 if attempt >= _MAX_RETRIES:
                     raise
                 logger.info("Transient fetch error (%s), retry %s: %s", url, attempt + 1, exc)
-                await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(1.5 * (2 ** attempt))  # exponential backoff (FR-CRAWL-002)
                 continue
             if response.status_code in _TRANSIENT_STATUS and attempt < _MAX_RETRIES:
                 logger.info("Transient %s from %s, retry %s", response.status_code, url, attempt + 1)
-                await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(1.5 * (2 ** attempt))  # exponential backoff (FR-CRAWL-002)
                 continue
             response.raise_for_status()
             break

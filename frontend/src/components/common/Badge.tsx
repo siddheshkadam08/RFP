@@ -1,5 +1,7 @@
 import { HTMLAttributes } from 'react';
 
+import { scoreBand } from '@/utils/score';
+
 export type BadgeVariant = 'success' | 'warning' | 'danger' | 'info' | 'neutral';
 export type BadgeSize = 'sm' | 'md';
 
@@ -23,15 +25,12 @@ const sizeClasses: Record<BadgeSize, string> = {
 };
 
 export const getScoreVariant = (score?: number | null): BadgeVariant => {
-  if ((score ?? 0) >= 71) {
-    return 'success';
-  }
-
-  if ((score ?? 0) >= 41) {
-    return 'warning';
-  }
-
-  return 'danger';
+  const variants: Record<ReturnType<typeof scoreBand>, BadgeVariant> = {
+    high: 'success',
+    medium: 'warning',
+    low: 'danger',
+  };
+  return variants[scoreBand(score)];
 };
 
 export const getStatusBadgeClass = (status: string) => {

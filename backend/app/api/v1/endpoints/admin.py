@@ -7,7 +7,7 @@ from datetime import date
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -130,7 +130,9 @@ async def list_users(
 
 
 @router.post("/users", status_code=status.HTTP_201_CREATED)
-async def create_user(payload: AdminUserCreateRequest, db: DBSession, current_user: AdminUser) -> dict[str, Any]:
+async def create_user(
+    payload: AdminUserCreateRequest, db: DBSession, current_user: AdminUser, request: Request
+) -> dict[str, Any]:
     """Create a new user account from the admin console."""
     try:
         user_data = _model_dump(payload)
@@ -140,6 +142,12 @@ async def create_user(payload: AdminUserCreateRequest, db: DBSession, current_us
             result = await auth_service.create_user(db=db, user_data=user_data)
         else:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin service is not available")
+        if audit_service is not None:
+            await audit_service.log_action_safe(
+                db, user_id=current_user.sub, action="user_created", resource_type="user",
+                resource_id=str(getattr(result, "id", "")) or None,
+                details={"email": user_data.get("email")}, ip_address=audit_service.client_ip(request),
+            )
         return _success_response(_serialize_user(result) if hasattr(result, "id") else result)
     except AppException:
         raise
@@ -156,6 +164,7 @@ async def update_user(
     payload: AdminUserUpdateRequest,
     db: DBSession,
     current_user: AdminUser,
+    request: Request,
 ) -> dict[str, Any]:
     """Update a user account from the admin console."""
     try:
@@ -171,6 +180,12 @@ async def update_user(
             result = await auth_service.update_user(db=db, user_id=user_id, update_data=update_data)
         else:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin service is not available")
+        if audit_service is not None:
+            await audit_service.log_action_safe(
+                db, user_id=current_user.sub, action="user_updated", resource_type="user",
+                resource_id=str(user_id), details={"fields": sorted(update_data.keys())},
+                ip_address=audit_service.client_ip(request),
+            )
         return _success_response(_serialize_user(result) if hasattr(result, "id") else result)
     except AppException:
         raise

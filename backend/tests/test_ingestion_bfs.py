@@ -26,6 +26,14 @@ class _FakeDB:
     async def rollback(self): return None
 
 
+class _NoOpGate:
+    """Stand-in for RobotsGate so the frontier tests stay offline (no robots.txt fetch/sleep)."""
+
+    def __init__(self, *a, **k): pass
+    async def allowed(self, url): return True
+    async def throttle(self, url): return None
+
+
 class _FakeSource:
     id = "sid"
     url = "https://site/root"
@@ -41,7 +49,7 @@ def _fetched(url: str) -> FetchedContent:
 @pytest.fixture
 def crawl(monkeypatch):
     """Patch the I/O boundaries and return a runner that reports (processed, fetched, result)."""
-    async def _run(max_depth: int, max_pages: int):
+    async def _run(max_depth: int, max_pages: int, gate_cls=_NoOpGate):
         processed: list[str] = []
         fetched: list[str] = []
 
@@ -64,6 +72,7 @@ def crawl(monkeypatch):
         monkeypatch.setattr(mod, "_expand_page", fake_expand)
         monkeypatch.setattr(mod, "_gate_candidates", fake_gate)
         monkeypatch.setattr(mod, "_process_page", fake_process)
+        monkeypatch.setattr(mod, "RobotsGate", gate_cls)  # no robots.txt I/O in frontier tests
         monkeypatch.setattr(mod.settings, "CRAWL_MAX_DEPTH", max_depth)
         monkeypatch.setattr(mod.settings, "CRAWL_MAX_PAGES", max_pages)
 
@@ -94,3 +103,18 @@ async def test_depth_limit_stops_recursion(crawl):
 async def test_page_budget_caps_fetches(crawl):
     _, _, result = await crawl(max_depth=3, max_pages=2)
     assert result["pages_fetched"] == 2
+
+
+async def test_robots_disallowed_links_are_skipped(crawl):
+    """A robots.txt-disallowed frontier URL is never fetched and is counted, not crawled."""
+
+    class _BlockDetailB:
+        def __init__(self, *a, **k): pass
+        async def allowed(self, url): return "detailB" not in url
+        async def throttle(self, url): return None
+
+    processed, fetched, result = await crawl(max_depth=3, max_pages=100, gate_cls=_BlockDetailB)
+    assert "https://site/detailB" not in fetched      # disallowed -> never fetched
+    assert "https://site/detailB" not in processed
+    assert "https://site/detailA" in processed        # allowed siblings still crawled
+    assert result["skipped_disallowed"] >= 1

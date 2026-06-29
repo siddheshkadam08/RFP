@@ -26,6 +26,7 @@ from app.models.document import Document, DocumentEmbedding, DocumentType, Proce
 from app.models.opportunity import OpportunityCategory
 from app.models.source import CrawlStatus, Source
 from app.services import ai_service, alert_service, crawler, document_service, opportunity_service
+from app.services.robots import RobotsGate
 from app.services.url_fetcher import FetchedContent, fetch_raw_text, fetch_url_content, render_interactive
 
 logger = logging.getLogger(__name__)
@@ -365,6 +366,7 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
     ``CRAWL_MAX_PAGES`` fetch budget. Never raises."""
     source_id = source.id
     source_url = source.url
+    gate = RobotsGate()  # robots.txt allow-checks + per-origin rate limiting (FR-CRAWL-005)
 
     async def _mark_source(crawl_status: CrawlStatus) -> None:
         await db.execute(
@@ -379,6 +381,12 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
         await db.commit()
 
     # 1. Fetch the root (best-effort) ---------------------------------------
+    if not await gate.allowed(source_url):
+        logger.info("robots.txt disallows root %s; skipping source %s", source_url, source_id)
+        await _mark_source(CrawlStatus.SUCCESS)  # ran cleanly — the site just opts out
+        return {"source_id": str(source_id), "status": "skipped", "reason": "robots_disallow",
+                "documents_created": 0, "opportunities_created": 0}
+    await gate.throttle(source_url)
     try:
         fetched = await fetch_url_content(source_url)
     except Exception as exc:  # noqa: BLE001
@@ -408,6 +416,7 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
     page_results: list[dict[str, Any]] = []
     total_candidates = 0
     skipped_irrelevant = 0
+    skipped_disallowed = 0
 
     async def _enqueue(content_links: list, pagination_urls: list, depth: int) -> None:
         """Gate content links (-> depth+1, processed) and enqueue pagination (-> same depth, expand-only)."""
@@ -431,6 +440,10 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
     fetches = 0
     while frontier and fetches < settings.CRAWL_MAX_PAGES:
         item = frontier.popleft()
+        if not await gate.allowed(item.url):
+            skipped_disallowed += 1
+            continue
+        await gate.throttle(item.url)  # honor crawl-delay / per-origin rate limit
         try:
             page = await fetch_url_content(item.url)
         except Exception as exc:  # noqa: BLE001 - skip a bad link, keep crawling
@@ -444,8 +457,10 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
             await _enqueue(links, pagination, depth=item.depth)
 
     logger.info(
-        "Source %s crawl: %s fetched, %s processed, %s candidates (skipped %s irrelevant), depth<=%s",
-        source_id, fetches, len(page_results), total_candidates, skipped_irrelevant, settings.CRAWL_MAX_DEPTH,
+        "Source %s crawl: %s fetched, %s processed, %s candidates "
+        "(skipped %s irrelevant, %s robots-disallowed), depth<=%s",
+        source_id, fetches, len(page_results), total_candidates,
+        skipped_irrelevant, skipped_disallowed, settings.CRAWL_MAX_DEPTH,
     )
     await _mark_source(CrawlStatus.SUCCESS)
     return {
@@ -454,6 +469,7 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
         "mode": "crawl",
         "candidates": total_candidates,
         "skipped_irrelevant": skipped_irrelevant,
+        "skipped_disallowed": skipped_disallowed,
         "pages_fetched": fetches,
         "pages_followed": len(page_results),
         "max_depth": settings.CRAWL_MAX_DEPTH,

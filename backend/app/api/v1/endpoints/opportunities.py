@@ -7,7 +7,7 @@ from datetime import date
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from app.core.geo import SOURCE_COUNTRIES, SOURCE_REGIONS
 from app.core.security import TokenPayload, get_current_user
 from app.models.opportunity import Opportunity, OpportunityCategory, OpportunityStatus
 from app.schemas.opportunity import OpportunityListResponse, OpportunityResponse
+from app.services import audit_service
 
 # Standards taxonomy tracked by the platform (per the spec); bound to the Explorer filter.
 OPPORTUNITY_STANDARDS = ["XBRL", "iXBRL", "XBRL-CSV", "XBRL-JSON", "SDMX", "ISO 20022", "DPM", "Taxonomies"]
@@ -258,6 +259,7 @@ async def update_opportunity(
     payload: OpportunityUpdateRequest,
     current_user: CurrentUser,
     db: DBSession,
+    request: Request,
 ) -> dict[str, Any]:
     """Update an opportunity's status, owner, or notes."""
     try:
@@ -272,6 +274,11 @@ async def update_opportunity(
             )
         except TypeError:
             result = await service.update_opportunity(db=db, opp_id=opportunity_id, update_data=update_data)
+        await audit_service.log_action_safe(
+            db, user_id=current_user.sub, action="opportunity_updated", resource_type="opportunity",
+            resource_id=str(opportunity_id), details={"fields": sorted(update_data.keys())},
+            ip_address=audit_service.client_ip(request),
+        )
         return _success_response(_serialize_opportunity(result))
     except AppException:
         raise

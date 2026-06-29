@@ -7,6 +7,7 @@ import EmptyState from '@/components/common/EmptyState';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
 import { getApiErrorMessage } from '@/services/api';
 import { exportOpportunities, getOpportunityOptions, searchOpportunities, type OpportunityOptions } from '@/services/opportunities';
+import { scoreBand as scoreBandLabel } from '@/utils/score';
 import type { Opportunity, PaginatedResponse, SearchFilters } from '@/utils/types';
 
 const labelize = (value: string) => value.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
@@ -54,13 +55,13 @@ const fieldClass =
   'w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100';
 const multiClass = 'min-h-24 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-500';
 
-// Score-badge color band (matches getScoreVariant: >=71 high, >=41 medium).
-const scoreBand = (score?: number | null) => {
-  const value = score ?? 0;
-  if (value >= 71) return 'bg-emerald-50 text-emerald-700 ring-emerald-200';
-  if (value >= 41) return 'bg-amber-50 text-amber-700 ring-amber-200';
-  return 'bg-rose-50 text-rose-700 ring-rose-200';
-};
+// Score-badge color band (spec doc04 §14: >=80 high, 50-79 medium, <50 low).
+const scoreBand = (score?: number | null) =>
+  ({
+    high: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
+    medium: 'bg-amber-50 text-amber-700 ring-amber-200',
+    low: 'bg-rose-50 text-rose-700 ring-rose-200',
+  })[scoreBandLabel(score)];
 
 const OpportunityExplorerPage = () => {
   const navigate = useNavigate();

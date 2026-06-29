@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from app.core.scoring import score_band
 from app.services.ai_service import (
     check_relevance,
     classify_opportunity,
@@ -147,8 +148,4 @@ def get_score_band(score: int) -> str:
     Returns:
         Score band: 'low', 'medium', or 'high'.
     """
-    if score >= 71:
-        return "high"
-    elif score >= 41:
-        return "medium"
-    return "low"
+    return score_band(score)

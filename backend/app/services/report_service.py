@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from app.core.config import settings
 from app.core.database import AsyncSession
 from app.core.exceptions import NotFoundException
+from app.core.scoring import SCORE_HIGH_MIN
 from app.models.opportunity import Opportunity, OpportunityStatus
 from app.models.report import Report, ReportStatus, ReportType
 from app.services import ai_service, export_service
@@ -190,7 +191,7 @@ async def _assemble(
         f"New ({'30d' if report_type == ReportType.MONTHLY else '7d'})": len(new_items),
         "Active": len(active),
         "Closed": len(closed),
-        "High priority (score >= 71)": sum(1 for o in base if (o.score or 0) >= 71),
+        f"High priority (score >= {SCORE_HIGH_MIN})": sum(1 for o in base if (o.score or 0) >= SCORE_HIGH_MIN),
         "Regions covered": len({o.region for o in base}),
     }
     sections = {

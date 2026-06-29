@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     CRAWL_INTERACT_MAX_CLICKS: int = 15  # cap on Load-More / scroll / pager iterations per page
     CRAWL_THIN_TEXT_THRESHOLD: int = 300  # below this many chars, try a JS render
     CRAWL_MIN_CANDIDATES_BEFORE_RENDER: int = 3  # listing yielding fewer static candidates -> interactive render
+    # Politeness / compliance (FR-CRAWL-005): honor robots.txt and rate-limit per origin.
+    CRAWL_RESPECT_ROBOTS: bool = True  # obey robots.txt Disallow rules for our declared bot UA
+    CRAWL_DEFAULT_DELAY_SECONDS: float = 1.0  # min gap between requests to the same origin
+    CRAWL_MAX_DELAY_SECONDS: float = 30.0  # cap on a site's robots Crawl-delay we will honor
 
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 

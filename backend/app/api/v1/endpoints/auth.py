@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +14,7 @@ from app.core.database import get_db
 from app.core.exceptions import AppException, UnauthorizedException
 from app.core.security import TokenPayload, create_access_token, get_current_user, role_required
 from app.models.user import UserRole
+from app.services import audit_service
 
 try:
     from app.schemas.auth import LoginRequest, UserCreate as UserCreateRequest
@@ -85,7 +86,7 @@ def _serialize_user(user: Any) -> dict[str, Any]:
 
 
 @router.post("/login", status_code=status.HTTP_200_OK)
-async def login(payload: LoginRequest, db: DBSession) -> dict[str, Any]:
+async def login(payload: LoginRequest, db: DBSession, request: Request) -> dict[str, Any]:
     """Authenticate a user with email and password and return a JWT."""
     try:
         service = _get_service()
@@ -94,12 +95,21 @@ async def login(payload: LoginRequest, db: DBSession) -> dict[str, Any]:
             return _success_response(result)
 
         credentials = _model_dump(payload)
+        ip = audit_service.client_ip(request)
         user = await service.authenticate_user(db, credentials["email"], credentials["password"])
         if user is None:
+            await audit_service.log_action_safe(
+                db, action="login_failed", resource_type="auth",
+                details={"email": credentials["email"]}, ip_address=ip,
+            )
             raise UnauthorizedException("Invalid email or password")
 
         role = user.role.value if hasattr(user.role, "value") else str(user.role)
         token = create_access_token(subject=str(user.id), email=user.email, roles=[role])
+        await audit_service.log_action_safe(
+            db, user_id=user.id, action="login", resource_type="auth",
+            resource_id=str(user.id), ip_address=ip,
+        )
         return _success_response({"token": token, "user": _serialize_user(user)})
     except AppException:
         raise

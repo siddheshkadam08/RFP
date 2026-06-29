@@ -11,9 +11,11 @@ It reuses the existing fetcher (``url_fetcher.fetch_url_content``) and AI pipeli
 from __future__ import annotations
 
 import logging
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urlparse
 
 from sqlalchemy import update
 
@@ -24,7 +26,7 @@ from app.models.document import Document, DocumentEmbedding, DocumentType, Proce
 from app.models.opportunity import OpportunityCategory
 from app.models.source import CrawlStatus, Source
 from app.services import ai_service, alert_service, crawler, document_service, opportunity_service
-from app.services.url_fetcher import FetchedContent, fetch_raw_text, fetch_url_content
+from app.services.url_fetcher import FetchedContent, fetch_raw_text, fetch_url_content, render_interactive
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,7 @@ _DOC_TYPE_MAP = {
     "html": DocumentType.HTML,
     "pdf": DocumentType.PDF,
     "docx": DocumentType.DOCX,
+    "doc": DocumentType.DOCX,  # legacy binary Word -> nearest enum value
     "xlsx": DocumentType.XLSX,
 }
 
@@ -294,9 +297,72 @@ async def _discover_candidates(source: Source, fetched: FetchedContent) -> list:
     return candidates
 
 
+def _norm_url(url: str) -> str:
+    """Canonical key for de-duping the crawl frontier (drop fragment, lower host, trim slash)."""
+    parsed = urlparse(urldefrag(url)[0])
+    base = f"{parsed.scheme}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+    return f"{base}?{parsed.query}" if parsed.query else base
+
+
+@dataclass
+class _FrontierItem:
+    url: str
+    title: str
+    depth: int
+    process: bool  # True -> turn the page into a Document; False -> expand-only (listing/pagination)
+
+
+async def _gate_candidates(candidates: list) -> list:
+    """Relevance-gate candidate titles before fetching; on gate failure, keep all."""
+    if not candidates:
+        return []
+    titles = [c.title for c in candidates]
+    try:
+        mask = await ai_service.filter_relevant_titles(titles)
+    except Exception as exc:  # noqa: BLE001 - if the gate fails, don't drop everything
+        logger.warning("Title gate failed, following all candidates: %s", exc)
+        mask = [True] * len(titles)
+    return [c for c, keep in zip(candidates, mask) if keep]
+
+
+async def _expand_page(
+    source: Source, fetched: FetchedContent, *, allow_fallbacks: bool, interactive: bool = False
+) -> tuple[list, list]:
+    """Return ``(content_links, pagination_urls)`` for a fetched page.
+
+    ``allow_fallbacks`` enables the feed/sitemap discovery fallbacks (root only). ``interactive``
+    (root only) allows one JS-interaction re-render (Load-More / infinite-scroll / pager) when the
+    listing yields too few static candidates — gated to the root so detail pages, which naturally
+    have few links, don't each spawn a browser.
+    """
+    candidates = await _discover_candidates(source, fetched) if allow_fallbacks else crawler.select_candidates(source, fetched)
+
+    needs_render = (
+        interactive
+        and fetched.content_type == "html" and fetched.raw_html
+        and len(candidates) < settings.CRAWL_MIN_CANDIDATES_BEFORE_RENDER
+        and settings.CRAWL_RENDER_JS and settings.CRAWL_INTERACT_JS
+    )
+    if needs_render:
+        try:
+            rendered = await render_interactive(fetched.url)
+        except Exception as exc:  # noqa: BLE001 - interactive render is best-effort
+            logger.warning("Interactive render failed (%s): %s", fetched.url, exc)
+            rendered = None
+        if rendered:
+            known = {c.url for c in candidates}
+            candidates += [c for c in crawler.extract_links(fetched.url, rendered) if c.url not in known]
+
+    pagination: list = []
+    if fetched.content_type == "html" and fetched.raw_html:
+        pagination = crawler.discover_pagination(fetched.url, fetched.raw_html)
+    return candidates, pagination
+
+
 async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
-    """Crawl one source: fetch the root, then either follow relevance-gated child links
-    (listing/feed) or process the page directly (leaf/document). Never raises."""
+    """Crawl one source breadth-first: fetch the root, follow relevance-gated child links to
+    ``CRAWL_MAX_DEPTH`` (with pagination), process leaf/detail pages, all under a global
+    ``CRAWL_MAX_PAGES`` fetch budget. Never raises."""
     source_id = source.id
     source_url = source.url
 
@@ -322,50 +388,76 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
         return {"source_id": str(source_id), "status": "failed", "error": str(exc),
                 "documents_created": 0, "opportunities_created": 0}
 
-    # 2. Discover candidate links / feed entries ----------------------------
-    candidates = await _discover_candidates(source, fetched) if settings.CRAWL_FOLLOW_LINKS else []
+    # 2. Expand the root into content links + pagination --------------------
+    root_links, root_pagination = (
+        await _expand_page(source, fetched, allow_fallbacks=True, interactive=True)
+        if settings.CRAWL_FOLLOW_LINKS else ([], [])
+    )
 
-    # 3a. Listing/feed page: relevance-gate the titles, then follow the winners ----
-    if candidates:
-        titles = [c.title for c in candidates]
+    # 2b. Leaf/detail root (nothing to follow): process the page itself ------
+    if not root_links and not root_pagination:
+        result = await _process_page(db, source, fetched)
+        await _mark_source(CrawlStatus.SUCCESS if result.get("status") != "failed" else CrawlStatus.FAILED)
+        result["source_id"] = str(source_id)
+        result.setdefault("mode", "single")
+        return result
+
+    # 3. Breadth-first crawl ------------------------------------------------
+    visited: set[str] = {_norm_url(source_url)}
+    frontier: deque[_FrontierItem] = deque()
+    page_results: list[dict[str, Any]] = []
+    total_candidates = 0
+    skipped_irrelevant = 0
+
+    async def _enqueue(content_links: list, pagination_urls: list, depth: int) -> None:
+        """Gate content links (-> depth+1, processed) and enqueue pagination (-> same depth, expand-only)."""
+        nonlocal total_candidates, skipped_irrelevant
+        total_candidates += len(content_links)
+        gated = await _gate_candidates(content_links)
+        skipped_irrelevant += len(content_links) - len(gated)
+        for candidate in gated:
+            key = _norm_url(candidate.url)
+            if key not in visited:
+                visited.add(key)
+                frontier.append(_FrontierItem(candidate.url, candidate.title, depth + 1, process=True))
+        for page_url in pagination_urls:
+            key = _norm_url(page_url)
+            if key not in visited:
+                visited.add(key)
+                frontier.append(_FrontierItem(page_url, "", depth, process=False))
+
+    await _enqueue(root_links, root_pagination, depth=0)
+
+    fetches = 0
+    while frontier and fetches < settings.CRAWL_MAX_PAGES:
+        item = frontier.popleft()
         try:
-            mask = await ai_service.filter_relevant_titles(titles)
-        except Exception as exc:  # noqa: BLE001 - if the gate fails, don't drop everything
-            logger.warning("Title gate failed, following all candidates: %s", exc)
-            mask = [True] * len(titles)
-        relevant = [c for c, keep in zip(candidates, mask) if keep]
-        skipped_irrelevant = len(candidates) - len(relevant)
-        relevant = relevant[: settings.CRAWL_MAX_PAGES]
-        logger.info(
-            "Source %s: %s candidates -> %s relevant (skipped %s), following %s",
-            source_id, len(candidates), len(candidates) - skipped_irrelevant, skipped_irrelevant, len(relevant),
-        )
+            page = await fetch_url_content(item.url)
+        except Exception as exc:  # noqa: BLE001 - skip a bad link, keep crawling
+            logger.warning("Crawl fetch failed (%s): %s", item.url, exc)
+            continue
+        fetches += 1
+        if item.process:
+            page_results.append(await _process_page(db, source, page))
+        if item.depth < settings.CRAWL_MAX_DEPTH:
+            links, pagination = await _expand_page(source, page, allow_fallbacks=False)
+            await _enqueue(links, pagination, depth=item.depth)
 
-        page_results: list[dict[str, Any]] = []
-        for candidate in relevant:
-            try:
-                child = await fetch_url_content(candidate.url)
-            except Exception as exc:  # noqa: BLE001 - skip a bad child link
-                logger.warning("Child fetch failed (%s): %s", candidate.url, exc)
-                continue
-            page_results.append(await _process_page(db, source, child))
-
-        await _mark_source(CrawlStatus.SUCCESS)
-        return {
-            "source_id": str(source_id),
-            "status": "ok",
-            "mode": "crawl",
-            "candidates": len(candidates),
-            "skipped_irrelevant": skipped_irrelevant,
-            "pages_followed": len(page_results),
-            "documents_created": sum(r.get("documents_created", 0) for r in page_results),
-            "opportunities_created": sum(r.get("opportunities_created", 0) for r in page_results),
-            "results": page_results,
-        }
-
-    # 3b. Leaf/detail page or following disabled: process the page itself ----
-    result = await _process_page(db, source, fetched)
-    await _mark_source(CrawlStatus.SUCCESS if result.get("status") != "failed" else CrawlStatus.FAILED)
-    result["source_id"] = str(source_id)
-    result.setdefault("mode", "single")
-    return result
+    logger.info(
+        "Source %s crawl: %s fetched, %s processed, %s candidates (skipped %s irrelevant), depth<=%s",
+        source_id, fetches, len(page_results), total_candidates, skipped_irrelevant, settings.CRAWL_MAX_DEPTH,
+    )
+    await _mark_source(CrawlStatus.SUCCESS)
+    return {
+        "source_id": str(source_id),
+        "status": "ok",
+        "mode": "crawl",
+        "candidates": total_candidates,
+        "skipped_irrelevant": skipped_irrelevant,
+        "pages_fetched": fetches,
+        "pages_followed": len(page_results),
+        "max_depth": settings.CRAWL_MAX_DEPTH,
+        "documents_created": sum(r.get("documents_created", 0) for r in page_results),
+        "opportunities_created": sum(r.get("opportunities_created", 0) for r in page_results),
+        "results": page_results,
+    }

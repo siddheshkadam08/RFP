@@ -49,13 +49,19 @@ class Settings(BaseSettings):
     # backend working directory; the spec's external-drive STORAGE_ROOT can be set here later.
     REPORTS_DIR: str = "storage/reports"
 
-    # Crawler: relevance-gated, bounded, depth-1 link-following.
+    # Crawler: relevance-gated, bounded, multi-depth link-following.
     CRAWL_FOLLOW_LINKS: bool = True
-    CRAWL_MAX_PAGES: int = 12  # max relevant child pages fetched per source
-    CRAWL_MAX_LINK_CANDIDATES: int = 60  # max links/feed entries examined before the title gate
+    CRAWL_MAX_PAGES: int = 500  # global page budget per source crawl (across all depths)
+    CRAWL_MAX_LINK_CANDIDATES: int = 500  # max links/feed entries examined per page before the title gate
+    CRAWL_MAX_DEPTH: int = 3  # link-following recursion depth (0 = root only, 1 = root's children, ...)
+    CRAWL_MAX_PAGINATION: int = 20  # max "next page" hops followed per listing
+    CRAWL_ALLOW_CROSS_DOMAIN: bool = True  # follow same-registrable-domain links + cross-domain document links
     CRAWL_MAX_BYTES: int = 10_000_000  # skip responses larger than this
-    CRAWL_RENDER_JS: bool = True  # use Playwright to render thin/JS-only pages
+    CRAWL_RENDER_JS: bool = True  # use Playwright to render thin/JS-only/blocked pages
+    CRAWL_INTERACT_JS: bool = True  # drive "Load More"/infinite-scroll/__doPostBack pagers with Playwright
+    CRAWL_INTERACT_MAX_CLICKS: int = 15  # cap on Load-More / scroll / pager iterations per page
     CRAWL_THIN_TEXT_THRESHOLD: int = 300  # below this many chars, try a JS render
+    CRAWL_MIN_CANDIDATES_BEFORE_RENDER: int = 3  # listing yielding fewer static candidates -> interactive render
 
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 

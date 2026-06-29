@@ -23,10 +23,31 @@ _NOISE_PATH_TOKENS = (
     "/feedback", "/help", "/sitemap",
 )
 _NOISE_HOSTS = ("twitter.com", "x.com", "facebook.com", "linkedin.com", "youtube.com", "instagram.com", "t.me")
-_ALLOWED_DOC_EXT = (".pdf", ".docx", ".doc", ".xlsx", ".xls")
+_ALLOWED_DOC_EXT = (".pdf", ".docx", ".doc", ".xlsx", ".xls", ".rtf")
 _BLOCKED_EXT = (
     ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
     ".ttf", ".zip", ".mp4", ".mp3", ".webp",
+)
+
+# Embedded-document carriers (besides <a href>): these often hold the real PDF/viewer URL.
+_EMBED_SOURCES = (("iframe", "src"), ("embed", "src"), ("object", "data"))
+
+# Two-label public suffixes we must keep an extra label for when computing the registrable
+# domain (e.g. rbi.org.in from rbidocs.rbi.org.in). Covers the regions this system crawls.
+_MULTI_PART_SUFFIXES = frozenset((
+    "org.in", "gov.in", "nic.in", "co.in", "ac.in", "net.in", "res.in", "gen.in", "ind.in",
+    "co.uk", "gov.uk", "org.uk", "ac.uk", "me.uk", "ltd.uk", "plc.uk",
+    "com.au", "gov.au", "org.au", "net.au", "edu.au",
+    "com.sg", "gov.sg", "org.sg", "edu.sg", "com.my", "gov.my", "org.my",
+    "co.za", "org.za", "gov.za", "co.jp", "go.jp", "or.jp", "ne.jp",
+    "com.br", "gov.br", "org.br", "com.cn", "gov.cn", "org.cn", "edu.cn",
+    "com.hk", "gov.hk", "org.hk", "com.ph", "gov.ph", "com.ng", "gov.ng",
+))
+
+# Anchor text/aria that marks a "next page" / "load more" pagination control.
+_NEXT_TEXT_TOKENS = (
+    "next", "older", "load more", "show more", "view more", "more results",
+    "›", "»", "→", ">>", "next page",
 )
 
 
@@ -34,6 +55,56 @@ _BLOCKED_EXT = (
 class LinkCandidate:
     url: str
     title: str
+
+
+def registrable_domain(host: str) -> str:
+    """Best-effort eTLD+1 (registrable domain) without external deps.
+
+    ``rbidocs.rbi.org.in`` and ``www.rbi.org.in`` both reduce to ``rbi.org.in`` so a
+    document hosted on a sibling subdomain still counts as same-site. Falls back to the
+    last two labels for unknown suffixes.
+    """
+    host = (host or "").lower().strip().rstrip(".")
+    if not host or host.replace(".", "").isdigit():  # empty or bare IP
+        return host
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    if ".".join(labels[-2:]) in _MULTI_PART_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _same_site(host_a: str, host_b: str) -> bool:
+    rd_a, rd_b = registrable_domain(host_a), registrable_domain(host_b)
+    return bool(rd_a) and rd_a == rd_b
+
+
+def _accept_url(absolute: str, base_host: str) -> str | None:
+    """Classify a discovered URL: 'doc', 'page', or None (skip).
+
+    Honors the cross-domain policy — HTML pages must share the base's registrable domain,
+    while document links (PDF/Word/Excel) may live on a separate host/CDN.
+    """
+    parsed = urlparse(absolute)
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if any(host in parsed.netloc for host in _NOISE_HOSTS):
+        return None
+    path_lower = parsed.path.lower()
+    if path_lower.endswith(_BLOCKED_EXT):
+        return None
+    same_site = parsed.netloc == base_host or (
+        settings.CRAWL_ALLOW_CROSS_DOMAIN and _same_site(parsed.netloc, base_host)
+    )
+    if path_lower.endswith(_ALLOWED_DOC_EXT):
+        # Documents may be hosted off-domain; allow when cross-domain is enabled.
+        return "doc" if (same_site or settings.CRAWL_ALLOW_CROSS_DOMAIN) else None
+    if not same_site:
+        return None
+    if any(token in path_lower for token in _NOISE_PATH_TOKENS):
+        return None
+    return "page"
 
 
 def slug_title(url: str) -> str:
@@ -44,37 +115,78 @@ def slug_title(url: str) -> str:
 
 
 def extract_links(base_url: str, raw_html: str) -> list[LinkCandidate]:
-    """Same-domain, de-noised, deduped content links (+ their best-available title)."""
+    """De-noised, deduped content + document links (+ their best-available title).
+
+    Follows same-registrable-domain HTML pages and (cross-domain) document links, and also
+    mines ``<iframe>/<embed>/<object>`` carriers so embedded PDFs/viewers are not missed.
+    """
     soup = BeautifulSoup(raw_html, "html.parser")
     base_host = urlparse(base_url).netloc
     base_norm = base_url.rstrip("/")
     seen: set[str] = set()
     candidates: list[LinkCandidate] = []
 
-    for anchor in soup.find_all("a", href=True):
-        href = anchor["href"].strip()
+    def _add(href: str, title_hint: str) -> bool:
+        """Append a candidate; return False once the per-page cap is hit."""
+        if len(candidates) >= settings.CRAWL_MAX_LINK_CANDIDATES:
+            return False
+        href = (href or "").strip()
         if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
-            continue
+            return True
+        absolute = urldefrag(urljoin(base_url, href))[0]
+        if _accept_url(absolute, base_host) is None:
+            return True
+        if absolute.rstrip("/") == base_norm or absolute in seen:
+            return True
+        seen.add(absolute)
+        title = (title_hint or "").strip() or slug_title(absolute)
+        candidates.append(LinkCandidate(url=absolute, title=title[:300]))
+        return True
+
+    for anchor in soup.find_all("a", href=True):
+        title = anchor.get_text(strip=True) or (anchor.get("title") or "")
+        if not _add(anchor["href"], title):
+            return candidates
+    for tag_name, attr in _EMBED_SOURCES:
+        for element in soup.find_all(tag_name):
+            if not _add(element.get(attr) or "", element.get("title") or ""):
+                return candidates
+    return candidates
+
+
+def discover_pagination(base_url: str, raw_html: str) -> list[str]:
+    """Same-host 'next page' URLs for a listing (``rel=next`` + next/load-more anchors).
+
+    Returns GET-followable URLs only; ``__doPostBack`` pagers (no real href) are left to the
+    interactive Playwright path. Capped by ``CRAWL_MAX_PAGINATION``.
+    """
+    soup = BeautifulSoup(raw_html, "html.parser")
+    base_host = urlparse(base_url).netloc
+    base_norm = urldefrag(base_url)[0].rstrip("/")
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(href: str) -> None:
+        href = (href or "").strip()
+        if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            return
         absolute = urldefrag(urljoin(base_url, href))[0]
         parsed = urlparse(absolute)
         if parsed.scheme not in ("http", "https") or parsed.netloc != base_host:
-            continue  # same-domain only
-        if any(host in parsed.netloc for host in _NOISE_HOSTS):
-            continue
-        lower = absolute.lower()
-        if lower.endswith(_BLOCKED_EXT):
-            continue
-        is_doc = lower.endswith(_ALLOWED_DOC_EXT)
-        if not is_doc and any(token in parsed.path.lower() for token in _NOISE_PATH_TOKENS):
-            continue
+            return
         if absolute.rstrip("/") == base_norm or absolute in seen:
-            continue  # don't follow self / duplicates
+            return
         seen.add(absolute)
-        title = anchor.get_text(strip=True) or (anchor.get("title") or "").strip() or slug_title(absolute)
-        candidates.append(LinkCandidate(url=absolute, title=title[:300]))
-        if len(candidates) >= settings.CRAWL_MAX_LINK_CANDIDATES:
-            break
-    return candidates
+        out.append(absolute)
+
+    for link in soup.find_all(["a", "link"], href=True):
+        if "next" in " ".join(link.get("rel") or []).lower():
+            _add(link["href"])
+    for anchor in soup.find_all("a", href=True):
+        label = (anchor.get_text(strip=True) or anchor.get("aria-label") or anchor.get("title") or "").lower()
+        if label and len(label) <= 20 and any(token in label for token in _NEXT_TEXT_TOKENS):
+            _add(anchor["href"])
+    return out[: settings.CRAWL_MAX_PAGINATION]
 
 
 def discover_feed(base_url: str, raw_html: str) -> str | None:
@@ -130,11 +242,7 @@ def candidates_from_locs(locs: list[str], base_url: str) -> list[LinkCandidate]:
     seen: set[str] = set()
     candidates: list[LinkCandidate] = []
     for url in locs:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https") or parsed.netloc != base_host:
-            continue
-        lower = url.lower()
-        if lower.endswith(_BLOCKED_EXT):
+        if _accept_url(url, base_host) is None:
             continue
         if url.rstrip("/") == base_norm or url in seen:
             continue
@@ -158,7 +266,7 @@ def select_candidates(source: Source, fetched: FetchedContent) -> list[LinkCandi
     """
     source_type = getattr(source.source_type, "value", source.source_type)
 
-    if source_type == SourceType.PDF.value or fetched.content_type in ("pdf", "docx", "xlsx"):
+    if source_type == SourceType.PDF.value or fetched.content_type in ("pdf", "docx", "doc", "xlsx"):
         return []
     if source_type == SourceType.RSS_FEED.value or _looks_like_feed(fetched):
         return parse_feed(fetched.raw_html or fetched.text)

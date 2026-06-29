@@ -174,13 +174,15 @@ def _extract_budget_value(budget: Any) -> float | None:
         return float(budget)
 
     text = str(budget).lower().replace(",", "")
-    match = re.search(r"(\d+(?:\.\d+)?)\s*(m|million|k|thousand)?", text)
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(billion|bn|b|million|m|thousand|k)?", text)
     if not match:
         return None
 
     value = float(match.group(1))
     suffix = match.group(2)
-    if suffix in {"m", "million"}:
+    if suffix in {"b", "bn", "billion"}:
+        value *= 1_000_000_000
+    elif suffix in {"m", "million"}:
         value *= 1_000_000
     elif suffix in {"k", "thousand"}:
         value *= 1_000
@@ -232,6 +234,33 @@ def _default_score_breakdown(opportunity_data: dict[str, Any]) -> dict[str, int]
         "technology": technology,
         "competition": competition,
     }
+
+
+# The scoring prompt emits descriptive key names (e.g. "strategic_relevance"), while the
+# stored breakdown / weighting use short column names. Accept both spellings per component
+# so the model's actual scores are used instead of silently falling back to the heuristic.
+# The first alias is the prompt's key; the short alias keeps older/looser outputs working.
+_SCORE_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    "strategic": ("strategic_relevance", "strategic"),
+    "budget": ("budget_potential", "budget"),
+    "timeline": ("timeline_urgency", "timeline"),
+    "technology": ("technology_match", "technology"),
+    "competition": ("competition",),
+}
+
+
+def _pick_component(breakdown: dict[str, Any], component: str, default: int) -> int:
+    """Return the model's score for ``component`` (trying each accepted alias), clamped to
+    0-100; fall back to ``default`` (the heuristic) if no alias is present or parseable."""
+    for key in _SCORE_KEY_ALIASES[component]:
+        value = breakdown.get(key)
+        if value is None:
+            continue
+        try:
+            return max(0, min(100, int(round(float(value)))))
+        except (TypeError, ValueError):
+            continue
+    return default
 
 
 def _weighted_score(breakdown: dict[str, Any]) -> int:
@@ -350,15 +379,17 @@ async def score_opportunity(opportunity_data: dict[str, Any]) -> dict[str, Any]:
                 {"role": "user", "content": json.dumps(opportunity_data, default=str)},
             ]
         )
-        breakdown = result.get("breakdown") if isinstance(result.get("breakdown"), dict) else result
+        inner = result.get("breakdown") if isinstance(result, dict) else None
+        breakdown = inner if isinstance(inner, dict) else (result if isinstance(result, dict) else {})
         normalized = {
-            "strategic": int(float(breakdown.get("strategic", fallback_breakdown["strategic"]))),
-            "budget": int(float(breakdown.get("budget", fallback_breakdown["budget"]))),
-            "timeline": int(float(breakdown.get("timeline", fallback_breakdown["timeline"]))),
-            "technology": int(float(breakdown.get("technology", fallback_breakdown["technology"]))),
-            "competition": int(float(breakdown.get("competition", fallback_breakdown["competition"]))),
+            component: _pick_component(breakdown, component, fallback_breakdown[component])
+            for component in _SCORE_KEY_ALIASES
         }
-        return {"score": _weighted_score(normalized), "breakdown": normalized}
+        scored: dict[str, Any] = {"score": _weighted_score(normalized), "breakdown": normalized}
+        reasoning = result.get("reasoning") if isinstance(result, dict) else None
+        if isinstance(reasoning, str) and reasoning.strip():
+            scored["reasoning"] = reasoning.strip()
+        return scored
     except Exception as exc:
         logger.warning("Opportunity scoring fallback used: %s", exc)
         return fallback

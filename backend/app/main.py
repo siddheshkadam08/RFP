@@ -16,6 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.core.config import settings
 from app.core.database import engine
 from app.core.exceptions import AppException
+from app.core.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ def _configure_cors(app: FastAPI) -> None:
 
 def create_application() -> FastAPI:
     """Application factory used by ASGI servers and tests."""
+    setup_logging()
+
     app = FastAPI(
         title=settings.PROJECT_NAME,
         debug=settings.DEBUG,

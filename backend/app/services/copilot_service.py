@@ -24,23 +24,51 @@ from app.services import ai_service, search_service
 
 logger = logging.getLogger(__name__)
 
-_RETRIEVE_K = 6
+_RETRIEVE_K = 8
 _HISTORY_LIMIT = 10
 # Minimum top cosine similarity (1 - distance) for an answer to be considered grounded.
-# Calibrated: in-corpus questions score ~0.5-0.62, vague follow-ups ~0.22, off-corpus <0.14.
-_GROUNDING_THRESHOLD = 0.18
+# 0.35 = vectors share meaningful directional similarity; in-corpus questions score 0.5-0.62.
+_GROUNDING_THRESHOLD = 0.35
 
 _SYSTEM_PROMPT = (
-    "You are the RFP Intelligence Copilot. Answer ONLY using the numbered context items "
-    "provided below. Cite the supporting items inline as [n]. If the context does not "
-    "contain the answer, say you don't have enough information in the indexed corpus — "
-    "never use outside knowledge or invent details. Be concise and specific."
+    "You are the IRIS SupTech & RegTech Opportunity Intelligence Copilot.\n"
+    "\n"
+    "Your task is to answer the user's question using ONLY the numbered Context items "
+    "provided below. Do not use facts, figures, deadlines, budgets, or institution details "
+    "from your training data or from prior conversation turns.\n"
+    "\n"
+    "Rules:\n"
+    "1. Every factual claim must be immediately followed by a citation: [1], [2][3], etc.\n"
+    "2. If a specific fact (deadline, budget, institution name, country, standard) is not "
+    "present in the Context, say exactly: 'This information is not available in the indexed corpus.'\n"
+    "3. Do not infer, estimate, or approximate missing values.\n"
+    "4. For list questions, include all relevant Context items — do not truncate for brevity.\n"
+    "5. For single-fact questions, be concise: one or two sentences with citations.\n"
+    "6. You may use general domain knowledge only to define a term (e.g. 'XBRL is...') — "
+    "label such statements as [general knowledge] and never apply them as evidence for specific claims.\n"
+    "7. If no Context item is sufficiently relevant, respond: "
+    "'I could not find supporting evidence in the indexed opportunity corpus for that question.'\n"
+    "\n"
+    "Domain context: The corpus contains procurement opportunities, tenders, RFPs, strategic plans, "
+    "and announcements from central banks, financial regulators, deposit insurance agencies, and "
+    "standards bodies. Key fields per opportunity: institution, country, region, category, deadline, "
+    "budget, standards (XBRL/SDMX/ISO 20022/DPM/LEI), and scope."
 )
 
 _REWRITE_SYSTEM = (
-    "Rewrite the user's latest message into a single standalone search query for a "
-    "document-retrieval system, resolving any pronouns or references using the prior "
-    "conversation. Return ONLY the query text — no quotes, labels, or explanation."
+    "You are a query reformulation assistant for a SupTech and RegTech opportunity intelligence system.\n"
+    "\n"
+    "Rewrite the user's latest message into a single, self-contained search query that can be "
+    "understood without any prior conversation context. Resolve all pronouns, references "
+    "(e.g. 'those', 'that', 'it', 'them'), and elliptical references using the conversation history.\n"
+    "\n"
+    "Rules:\n"
+    "- Preserve all technical terms, acronyms, institution names, country names, and standard names "
+    "exactly as stated (e.g. XBRL, SDMX, ISO 20022, ECB, BIS, DPM, LEI).\n"
+    "- Output one query sentence only, maximum 25 words.\n"
+    "- Do not add explanations, quotes, labels, or prefixes.\n"
+    "- If the message is a greeting, off-topic statement, or not a searchable question, "
+    "return the message unchanged."
 )
 
 
@@ -99,12 +127,17 @@ async def _rewrite_query(message: str, history: list[ChatMessage]) -> str:
                 {"role": "system", "content": _REWRITE_SYSTEM},
                 {
                     "role": "user",
-                    "content": f"Conversation so far:\n{convo}\n\nLatest message: {message}\n\nStandalone search query:",
+                    "content": f"Conversation so far:\n{convo}\n\nLatest message: {message}\n\nRewritten query:",
                 },
             ],
             model="small",
         )
-        rewritten = (rewritten or "").strip().strip('"')
+        # Strip any prefix the model echoed (e.g. "Rewritten query: ...") and surrounding quotes
+        rewritten = (rewritten or "").strip()
+        for prefix in ("Rewritten query:", "Standalone search query:", "Query:"):
+            if rewritten.lower().startswith(prefix.lower()):
+                rewritten = rewritten[len(prefix):].strip()
+        rewritten = rewritten.strip('"\'')
         return rewritten or message
     except Exception as exc:  # noqa: BLE001 - rewrite is best-effort
         logger.warning("Copilot query rewrite failed, using raw message: %s", exc)
@@ -116,10 +149,28 @@ def _context_block(items: list[dict[str, Any]]) -> str:
     for index, item in enumerate(items, start=1):
         title = item.get("title") or "Untitled"
         body = item.get("snippet") or item.get("ai_summary") or item.get("summary") or ""
-        meta = " · ".join(str(v) for v in (item.get("region"), item.get("country"), item.get("source_url")) if v)
+        # Include key structured fields so the LLM can answer deadline/budget/institution questions
+        meta_parts: list[str] = []
+        if item.get("institution"):
+            meta_parts.append(f"Institution: {item['institution']}")
+        if item.get("country"):
+            meta_parts.append(f"Country: {item['country']}")
+        if item.get("region"):
+            meta_parts.append(f"Region: {item['region']}")
+        if item.get("deadline"):
+            meta_parts.append(f"Deadline: {item['deadline']}")
+        if item.get("budget") or item.get("score"):
+            budget = item.get("budget") or ""
+            score = item.get("score") or ""
+            if budget:
+                meta_parts.append(f"Budget: {budget}")
+            if score:
+                meta_parts.append(f"Score: {score}/100")
+        if item.get("source_url"):
+            meta_parts.append(f"Source: {item['source_url']}")
         block = f"[{index}] {title}\n{body}"
-        if meta:
-            block += f"\n({meta})"
+        if meta_parts:
+            block += "\n" + " | ".join(meta_parts)
         parts.append(block)
     return "\n\n".join(parts)
 
@@ -187,12 +238,18 @@ async def chat(db: AsyncSession, user_id: Any, chat_request: Any) -> dict[str, A
         citations: list[dict[str, Any]] = []
         confidence = 0.2
     else:
-        prompt_messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT}]
-        for msg in history:
+        # Context before history: prevents the "lost in the middle" attention dilution
+        # where long history causes the model to underweight the retrieval evidence.
+        prompt_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            # Inject context as the first user turn so it receives highest attention weight.
+            {"role": "user", "content": f"Context:\n{_context_block(items)}"},
+            {"role": "assistant", "content": "Understood. I will answer only from the provided context items above."},
+        ]
+        # Append recent history (capped at 6 turns to bound token usage and attention dilution).
+        for msg in history[-6:]:
             prompt_messages.append({"role": _role_value(msg.role), "content": msg.content})
-        prompt_messages.append(
-            {"role": "user", "content": f"Context:\n{_context_block(items)}\n\nQuestion: {message}"}
-        )
+        prompt_messages.append({"role": "user", "content": message})
         try:
             answer = await ai_service.chat_completion(prompt_messages, model="large")
         except Exception as exc:  # noqa: BLE001 - surface a graceful message, still persist

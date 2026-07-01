@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from sqlalchemy import func, or_, select
 
-from app.core.database import AsyncSession
+from app.core.database import AsyncSession, session_context
 from app.models.document import DocumentEmbedding
 from app.models.opportunity import Opportunity
 from app.services.ai_service import get_embedding
@@ -14,6 +15,18 @@ logger = logging.getLogger(__name__)
 
 # Candidate pool size fetched before merge/fusion + pagination.
 _POOL = 100
+
+# Minimum pg_trgm word_similarity for a row to qualify as a keyword hit.
+# Common English words share ~0.20–0.28 character trigrams with SupTech terms at random;
+# 0.30 clears that noise floor while keeping short-token queries ("LEI", "DPM", "ECB")
+# that still score above the bar via the ILIKE branch.
+_KW_TRGM_THRESHOLD = 0.30
+
+# Maximum cosine distance for a row to qualify as a semantic hit.
+# cosine_distance ∈ [0, 2]; threshold of 0.65 ≡ relevance (1 – distance) ≥ 0.35.
+# Deliberately aligned with the copilot grounding threshold so both surfaces apply
+# the same evidence floor and off-topic queries surface no results.
+_SEM_DISTANCE_THRESHOLD = 0.65
 
 
 def _enum(value: Any) -> Any:
@@ -107,7 +120,7 @@ async def keyword_search(
                 Opportunity.title.ilike(like),
                 Opportunity.institution.ilike(like),
                 Opportunity.ai_summary.ilike(like),
-                rank > 0.2,
+                rank > _KW_TRGM_THRESHOLD,
             )
         )
         stmt = _apply_search_filters(stmt, filters)
@@ -149,7 +162,11 @@ async def _keyword_ilike(
 # --------------------------------------------------------------------------- #
 async def _opportunity_semantic(db, query_vector, filters, limit) -> dict[str, tuple[Opportunity, float]]:
     distance = Opportunity.embedding.cosine_distance(query_vector)
-    stmt = select(Opportunity, distance.label("d")).where(Opportunity.embedding.isnot(None))
+    stmt = (
+        select(Opportunity, distance.label("d"))
+        .where(Opportunity.embedding.isnot(None))
+        .where(distance < _SEM_DISTANCE_THRESHOLD)
+    )
     stmt = _apply_search_filters(stmt, filters)
     rows = (await db.execute(stmt.order_by(distance).limit(limit))).all()
     return {str(opp.id): (opp, max(0.0, 1.0 - float(d))) for opp, d in rows}
@@ -162,6 +179,7 @@ async def _document_semantic(db, query_vector, filters, limit) -> dict[str, tupl
         select(DocumentEmbedding.document_id, min_dist.label("dist"))
         .where(DocumentEmbedding.embedding.isnot(None))
         .group_by(DocumentEmbedding.document_id)
+        .having(min_dist < _SEM_DISTANCE_THRESHOLD)
         .order_by(min_dist)
         .limit(limit)
     )
@@ -182,21 +200,32 @@ async def _document_semantic(db, query_vector, filters, limit) -> dict[str, tupl
 
 
 async def semantic_search(
-    db: AsyncSession, query: str, page: int, page_size: int, filters: dict[str, Any] | None = None
+    db: AsyncSession,
+    query: str,
+    page: int,
+    page_size: int,
+    filters: dict[str, Any] | None = None,
+    *,
+    query_vector: list[float] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Vector search over opportunity embeddings AND document-chunk embeddings (merged).
 
+    ``query_vector`` may be passed by ``hybrid_search`` to avoid a duplicate embedding call.
     Falls back to keyword search if the embedding resource is unavailable or nothing is embedded.
     """
     page = max(page, 1)
     page_size = max(page_size, 1)
 
-    try:
-        query_vector = await get_embedding(query.strip())
-    except Exception as exc:  # noqa: BLE001 - degrade gracefully
-        logger.warning("Semantic search falling back to keyword (embedding unavailable): %s", exc)
-        return await keyword_search(db, query, page, page_size, filters)
+    if query_vector is None:
+        try:
+            query_vector = await get_embedding(query.strip())
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            logger.warning("Semantic search falling back to keyword (embedding unavailable): %s", exc)
+            return await keyword_search(db, query, page, page_size, filters)
 
+    # Run sub-queries sequentially on the single request-scoped session.
+    # asyncpg connections are single-statement-at-a-time; running both via
+    # asyncio.gather on the same AsyncSession causes concurrent-use errors.
     opp_map = await _opportunity_semantic(db, query_vector, filters, _POOL)
     doc_map = await _document_semantic(db, query_vector, filters, _POOL)
 
@@ -208,7 +237,12 @@ async def semantic_search(
             merged[oid] = (opp, rel)
 
     if not merged:
-        return await keyword_search(db, query, page, page_size, filters)
+        # No embeddings cleared the similarity threshold — the query is off-topic
+        # or the corpus has no embeddings yet. Do NOT fall back to keyword here:
+        # falling back would surface unrelated keyword hits for off-topic queries.
+        # Callers that need a keyword fallback (e.g. hybrid_search) handle it explicitly.
+        logger.info("Semantic search returned 0 results above threshold for query: %.80s", query)
+        return [], 0
 
     ordered = sorted(merged.values(), key=lambda pair: pair[1], reverse=True)
     total = len(ordered)
@@ -226,13 +260,30 @@ async def hybrid_search(
     page = max(page, 1)
     page_size = max(page_size, 1)
 
-    keyword_hits, _ = await keyword_search(db, query, 1, _POOL // 2, filters)
-    semantic_hits, _ = await semantic_search(db, query, 1, _POOL // 2, filters)
+    # Embed once and reuse in semantic_search to avoid a duplicate LLM call.
+    try:
+        query_vector: list[float] | None = await get_embedding(query.strip())
+    except Exception as exc:  # noqa: BLE001 - degrade to keyword-only
+        logger.warning("Hybrid search embedding failed, falling back to keyword-only: %s", exc)
+        query_vector = None
+
+    # Run keyword and semantic arms concurrently using SEPARATE sessions — each
+    # arm needs its own asyncpg connection to allow true parallel execution.
+    # The request-scoped ``db`` is not passed here; both sessions come from the pool.
+    async def _kw_arm() -> tuple[list[dict[str, Any]], int]:
+        async with session_context() as db_kw:
+            return await keyword_search(db_kw, query, 1, _POOL, filters)
+
+    async def _sem_arm() -> tuple[list[dict[str, Any]], int]:
+        async with session_context() as db_sem:
+            return await semantic_search(db_sem, query, 1, _POOL, filters, query_vector=query_vector)
+
+    (keyword_items, _), (semantic_items, _) = await asyncio.gather(_kw_arm(), _sem_arm())
 
     k = 60  # RRF constant
     scores: dict[str, float] = {}
     pool: dict[str, dict[str, Any]] = {}
-    for ranking in (keyword_hits, semantic_hits):
+    for ranking in (keyword_items, semantic_items):
         for rank, item in enumerate(ranking):
             key = item["id"]
             scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)

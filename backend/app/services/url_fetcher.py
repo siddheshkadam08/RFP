@@ -157,6 +157,33 @@ def _extract_text_from_xlsx(data: bytes) -> tuple[str, str]:
     return "Spreadsheet", "\n".join(lines)
 
 
+_MAX_CSV_ROWS = 2000
+
+
+def _extract_text_from_csv(data: bytes) -> tuple[str, str]:
+    """Return (title, text) from CSV bytes (rows -> pipe-joined cells)."""
+    import csv
+
+    # Decode with UTF-8; fall back to latin-1 for government/regulator exports.
+    try:
+        text_data = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text_data = data.decode("latin-1", errors="replace")
+
+    reader = csv.reader(text_data.splitlines())
+    lines: list[str] = []
+    title = "CSV Data"
+    for index, row in enumerate(reader):
+        if index >= _MAX_CSV_ROWS:
+            break
+        cells = [cell.strip() for cell in row if cell.strip()]
+        if cells:
+            if index == 0:
+                title = " | ".join(cells[:5])  # use header row as title
+            lines.append(" | ".join(cells))
+    return title, "\n".join(lines)
+
+
 _SOFFICE_BIN: str | None = None  # cached LibreOffice path ("" = looked up, not found)
 
 
@@ -363,13 +390,13 @@ _TRANSIENT_STATUS = (502, 503, 504, 429)
 _MAX_RETRIES = 2  # extra attempts after the first (3 total)
 
 
-async def _http_get(url: str, timeout: float, headers: dict | None = None) -> httpx.Response:
+async def _http_get(url: str, timeout: float, headers: dict | None = None, verify: bool = True) -> httpx.Response:
     headers = headers or {
         "User-Agent": _USER_AGENT,
         "Accept": "text/html,application/pdf,application/rss+xml,*/*",
     }
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(timeout, connect=10.0), follow_redirects=True, max_redirects=5
+        timeout=httpx.Timeout(timeout, connect=10.0), follow_redirects=True, max_redirects=5, verify=verify
     ) as client:
         for attempt in range(_MAX_RETRIES + 1):
             try:
@@ -426,6 +453,17 @@ async def fetch_url_content(url: str, timeout: float = 30.0) -> FetchedContent:
     blocked pages with Playwright when enabled."""
     try:
         response = await _http_get(url, timeout)
+    except httpx.ConnectError as exc:
+        # Retry once without SSL verification for government/regulator portals that use
+        # self-signed or expired certificates (e.g. xbrl.bom.mu, some central bank portals).
+        # Only do this on SSL-related connection errors, not generic network failures.
+        if "ssl" not in str(exc).lower() and "certificate" not in str(exc).lower():
+            raise
+        logger.debug("SSL error for %s, retrying without certificate verification: %s", url, exc)
+        try:
+            response = await _http_get(url, timeout, verify=False)
+        except Exception:
+            raise exc  # raise the original SSL error, not a secondary one
     except httpx.HTTPStatusError as exc:
         # Blocked (e.g. 403/429). Escalate: retry once with browser-like headers (some
         # sites gate non-browser UAs), then fall back to a real browser render.
@@ -463,6 +501,10 @@ async def fetch_url_content(url: str, timeout: float = 30.0) -> FetchedContent:
     if "spreadsheetml" in content_type or lower_url.endswith(".xlsx"):
         title, text = _extract_text_from_xlsx(response.content)
         return _build(url, title, text, "xlsx", None)
+
+    if "text/csv" in content_type or "comma-separated" in content_type or lower_url.endswith(".csv"):
+        title, text = _extract_text_from_csv(response.content)
+        return _build(url, title, text, "csv", None)
 
     if "text/html" in content_type or "text/plain" in content_type or "xml" in content_type:
         raw_html = response.text

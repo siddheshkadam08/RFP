@@ -10,25 +10,29 @@ It reuses the existing fetcher (``url_fetcher.fetch_url_content``) and AI pipeli
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import urldefrag, urlparse
 
 from sqlalchemy import update
+from sqlalchemy.exc import InterfaceError as SAInterfaceError, OperationalError as SAOperationalError
 
 from app.agents.pipeline import PipelineStage, run_intelligence_pipeline
 from app.core.config import settings
-from app.core.database import AsyncSession
+from app.core.database import AsyncSession, session_context
+from app.core.logging_config import get_logger
 from app.models.document import Document, DocumentEmbedding, DocumentType, ProcessingStatus
 from app.models.opportunity import OpportunityCategory
 from app.models.source import CrawlStatus, Source
 from app.services import ai_service, alert_service, crawler, document_service, opportunity_service
+from app.services.document_service import sanitize_text
 from app.services.url_fetcher import FetchedContent, fetch_raw_text, fetch_url_content, render_interactive
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Cap text sent to the LLM to control token cost (mirrors the analyze endpoint).
 _MAX_CONTENT_CHARS = 15_000
@@ -40,6 +44,29 @@ _DOC_TYPE_MAP = {
     "doc": DocumentType.DOCX,  # legacy binary Word -> nearest enum value
     "xlsx": DocumentType.XLSX,
 }
+
+# SQLAlchemy / asyncpg errors that indicate a closed or recycled connection — safe to retry.
+_TRANSIENT_DB_ERRORS = (SAInterfaceError, SAOperationalError)
+
+
+async def _db_execute(fn: Any, retries: int = 2) -> Any:
+    """Execute an async callable performing DB work, retrying on transient connection errors.
+
+    Each retry re-invokes ``fn`` which should create a fresh ``session_context()`` call,
+    guaranteeing a live pooled connection regardless of how long the crawl has been running.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return await fn()
+        except _TRANSIENT_DB_ERRORS as exc:
+            if attempt >= retries:
+                raise
+            delay = 2.0 ** attempt
+            logger.warning(
+                "Transient DB error (attempt %s/%s), retrying in %.0fs: %s: %s",
+                attempt + 1, retries + 1, delay, type(exc).__name__, exc,
+            )
+            await asyncio.sleep(delay)
 
 
 def _now() -> datetime:
@@ -63,12 +90,26 @@ def _to_category(value: Any) -> OpportunityCategory:
 
 
 def _parse_deadline(value: Any) -> datetime | None:
-    """The extractor returns a string (or None); the column is a datetime."""
+    """Parse any deadline representation into a UTC-aware datetime.
+
+    Handles all formats any LLM or source might produce:
+    - datetime (aware or naive)
+    - date object (no time component)
+    - ISO 8601 string with or without timezone (YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, ...Z, ...+HH:MM)
+    - Any unrecognised value → None
+    """
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
         return value
+    if isinstance(value, date):  # date but NOT datetime (subclass check order matters)
+        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
     if isinstance(value, str) and value.strip():
         try:
-            return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except ValueError:
             return None
     return None
@@ -112,68 +153,129 @@ def _chunk_text(text: str, size: int = _CHUNK_SIZE, overlap: int = _CHUNK_OVERLA
     return chunks
 
 
-async def _embed_document(db: AsyncSession, document_id: Any, content_text: str) -> int:
-    """Chunk a document's text, embed each chunk, and persist ``DocumentEmbedding`` rows.
+async def _embed_document(document_id: Any, content_text: str) -> int:
+    """Chunk, embed, and persist DocumentEmbedding rows using a fresh short-lived session.
 
+    The DB connection is never held during LLM embedding calls (each takes 10-30 s).
+    All chunks are embedded first (phase 1), then saved in one short transaction (phase 2).
     Best-effort: any failure is logged and swallowed so it never blocks ingestion.
     """
+    content_text = sanitize_text(content_text) or ""
     chunks = _chunk_text(content_text)[:_MAX_CHUNKS]
     if not chunks:
         return 0
-    created = 0
-    try:
-        for index, chunk in enumerate(chunks):
-            try:
-                vector = await ai_service.get_embedding(chunk)
-            except Exception as exc:  # noqa: BLE001 - skip a single bad chunk
-                logger.warning("Chunk embedding skipped (doc %s, chunk %s): %s", document_id, index, exc)
-                continue
-            db.add(
-                DocumentEmbedding(
-                    document_id=document_id,
-                    chunk_index=index,
-                    chunk_text=chunk,
-                    embedding=vector,
-                )
-            )
-            created += 1
-        if created:
-            await db.commit()
-    except Exception as exc:  # noqa: BLE001 - never block ingest
-        logger.warning("Document embedding failed for doc %s: %s", document_id, exc)
-        await db.rollback()
+    logger.info("🧠 [EMBEDDING] doc_id=%s  chunk_count=%s", document_id, len(chunks))  # type: ignore[attr-defined]
+
+    # Phase 1: embed all chunks — no DB connection held during LLM calls.
+    embedded: list[tuple[int, str, list[float]]] = []
+    for index, chunk in enumerate(chunks):
+        try:
+            vector = await ai_service.get_embedding(chunk)
+            embedded.append((index, chunk, vector))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chunk embedding skipped (doc %s, chunk %s): %s", document_id, index, exc)
+
+    if not embedded:
         return 0
-    return created
+
+    # Phase 2: persist all embeddings in one short-lived session.
+    async def _save_embeddings() -> None:
+        async with session_context() as db:
+            for idx, ck, vec in embedded:
+                db.add(DocumentEmbedding(
+                    document_id=document_id,
+                    chunk_index=idx,
+                    chunk_text=sanitize_text(ck) or "",
+                    embedding=vec,
+                ))
+            await db.commit()
+
+    try:
+        await _db_execute(_save_embeddings)
+        logger.success("✅ [EMBEDDING SAVED] doc_id=%s  chunks_saved=%s", document_id, len(embedded))  # type: ignore[attr-defined]
+        return len(embedded)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Document embedding DB save failed for doc %s: %s", document_id, exc)
+        return 0
 
 
-async def _process_page(db: AsyncSession, source: Source, fetched: FetchedContent) -> dict[str, Any]:
+async def _process_page(source: Source, fetched: FetchedContent) -> dict[str, Any]:
     """De-dupe, persist a Document, run the AI pipeline, and (if relevant) create an
-    Opportunity for a single fetched page/document. Never raises — returns a summary dict."""
+    Opportunity for a single fetched page/document.
+
+    Each DB operation uses its own short-lived ``session_context()`` so no connection
+    is held during LLM pipeline calls (which can take 30-120 s per page).
+    Never raises — returns a summary dict.
+    """
     page_url = fetched.url
 
-    existing = await document_service.get_document_by_hash(db, fetched.content_hash)
+    # Step A: Sanitize — no DB.
+    original_len = len(fetched.text or "")
+    fetched.text = sanitize_text(fetched.text) or ""
+    clean_len = len(fetched.text)
+    if original_len != clean_len:
+        logger.info(  # type: ignore[attr-defined]
+            "🧹 [SANITIZED] url=%s  chars_removed=%s", page_url, original_len - clean_len
+        )
+
+    logger.data("📄 [CONTENT PREVIEW] url=%s\n    %s", page_url, fetched.text[:200])  # type: ignore[attr-defined]
+
+    # Step B: Check duplicate — short read, fresh session.
+    async def _check_dup() -> Any:
+        async with session_context() as db:
+            return await document_service.get_document_by_hash(db, fetched.content_hash)
+
+    try:
+        existing = await _db_execute(_check_dup)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ [PAGE FAILED] url=%s  error=%s: %s", page_url, type(exc).__name__, exc)  # type: ignore[attr-defined]
+        return {"status": "failed", "error": str(exc), "documents_created": 0,
+                "opportunities_created": 0, "url": page_url}
+
     if existing is not None:
+        logger.info("⏭️  [SKIPPED] url=%s  reason=duplicate", page_url)  # type: ignore[attr-defined]
         return {"status": "skipped", "reason": "duplicate", "documents_created": 0,
                 "opportunities_created": 0, "url": page_url}
 
+    # Step C: Persist document with PROCESSING status — short write, fresh session.
+    async def _create_doc() -> Any:
+        async with session_context() as db:
+            return await document_service.create_document(
+                db,
+                {
+                    "source_id": source.id,
+                    "url": page_url,
+                    "title": fetched.title,
+                    "content_text": fetched.text,
+                    "content_hash": fetched.content_hash,
+                    "document_type": _to_document_type(fetched.content_type),
+                    "language": "en",
+                    "processing_status": ProcessingStatus.PROCESSING,
+                    "metadata_json": {"content_type": fetched.content_type, "content_length": fetched.content_length},
+                },
+            )
+
     document_id = None
     try:
-        document = await document_service.create_document(
-            db,
-            {
-                "source_id": source.id,
-                "url": page_url,
-                "title": fetched.title,
-                "content_text": fetched.text,
-                "content_hash": fetched.content_hash,
-                "document_type": _to_document_type(fetched.content_type),
-                "language": "en",
-                "processing_status": ProcessingStatus.PROCESSING,
-                "metadata_json": {"content_type": fetched.content_type, "content_length": fetched.content_length},
-            },
-        )
-        document_id = document.id
+        logger.info("💾 [SAVING DOC] url=%s  title=%r", page_url, (fetched.title or "")[:80])  # type: ignore[attr-defined]
+        doc = await _db_execute(_create_doc)
+        document_id = doc.id
+        logger.success("✅ [DOC SAVED] doc_id=%s  url=%s", document_id, page_url)  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ [PAGE FAILED] url=%s  error=%s: %s", page_url, type(exc).__name__, exc)  # type: ignore[attr-defined]
+        return {"status": "failed", "error": str(exc), "documents_created": 0,
+                "opportunities_created": 0, "url": page_url}
 
+    # Steps D-G: AI pipeline + DB saves.  No session is held during LLM calls.
+    is_relevant = False
+    confidence = 0.0
+    opportunities_created = 0
+    opportunity_id: str | None = None
+    score = 0
+    relevance: dict[str, Any] = {}
+
+    try:
+        # Step D: Full AI pipeline — NO DB session held (30-120 s of LLM calls).
         content = fetched.text[:_MAX_CONTENT_CHARS]
         results = await run_intelligence_pipeline(content, {"source_id": str(source.id), "url": page_url})
         by_stage = {result.stage: result.data for result in results}
@@ -181,9 +283,11 @@ async def _process_page(db: AsyncSession, source: Source, fetched: FetchedConten
         is_relevant = bool(relevance.get("relevant", False))
         confidence = float(relevance.get("confidence", 0.0) or 0.0)
 
-        opportunities_created = 0
-        opportunity_id = None
-        score = 0
+        if not is_relevant:
+            logger.info(  # type: ignore[attr-defined]
+                "⏭️  [SKIPPED] url=%s  reason=not_relevant  confidence=%.2f  reason_text=%s",
+                page_url, confidence, relevance.get("reason", "")[:120],
+            )
 
         if is_relevant:
             extracted = by_stage.get(PipelineStage.EXTRACTION, {})
@@ -195,65 +299,94 @@ async def _process_page(db: AsyncSession, source: Source, fetched: FetchedConten
             title = _coalesce_title(extracted.get("title"), fetched.title)
             ai_summary = extracted.get("ai_summary") or ""
 
+            # Step E: opportunity embedding — LLM call, no DB session held.
             embedding = None
             try:
                 embedding = await ai_service.get_embedding(f"{title}\n{ai_summary}".strip())
-            except Exception as exc:  # noqa: BLE001 - embedding is optional
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Embedding skipped for %s: %s", page_url, exc)
 
-            opportunity = await opportunity_service.create_opportunity(
-                db,
-                {
-                    "document_id": document_id,
-                    "title": title,
-                    "institution": (extracted.get("institution") or "Unknown")[:255],
-                    "country": (extracted.get("country") or "Unknown")[:100],
-                    "region": source.region,  # pipeline has no region; use the source's
-                    "category": _to_category(classification.get("category")),
-                    "standards": standards if isinstance(standards, list) else [],
-                    "budget": _to_budget(extracted.get("budget")),
-                    "deadline": _parse_deadline(extracted.get("deadline")),
-                    "scope": extracted.get("scope"),
-                    "score": score,
-                    "score_breakdown": breakdown if isinstance(breakdown, dict) else {},
-                    "ai_summary": ai_summary,
-                    "ai_reasoning": relevance.get("reason") or "",
-                    "source_url": page_url,  # link the opportunity to its own page, not the listing
-                    "embedding": embedding,
-                },
-            )
+            # Step F: Persist opportunity — short write, fresh session.
+            async def _create_opp() -> Any:
+                async with session_context() as db:
+                    return await opportunity_service.create_opportunity(
+                        db,
+                        {
+                            "document_id": document_id,
+                            "title": sanitize_text(title),
+                            "institution": sanitize_text((extracted.get("institution") or "Unknown")[:255]),
+                            "country": sanitize_text((extracted.get("country") or "Unknown")[:100]),
+                            "region": sanitize_text(source.region),
+                            "category": _to_category(classification.get("category")),
+                            "standards": standards if isinstance(standards, list) else [],
+                            "budget": sanitize_text(_to_budget(extracted.get("budget"))),
+                            "deadline": _parse_deadline(extracted.get("deadline")),
+                            "scope": sanitize_text(extracted.get("scope")),
+                            "score": score,
+                            "score_breakdown": breakdown if isinstance(breakdown, dict) else {},
+                            "ai_summary": sanitize_text(ai_summary),
+                            "ai_reasoning": sanitize_text(relevance.get("reason") or ""),
+                            "source_url": sanitize_text(page_url),
+                            "embedding": embedding,
+                        },
+                    )
+
+            opp = await _db_execute(_create_opp)
             opportunities_created = 1
-            opportunity_id = str(opportunity.id)
+            opportunity_id = str(opp.id)
+            logger.success(  # type: ignore[attr-defined]
+                "✅ [OPPORTUNITY SAVED] opp_id=%s  title=%r  score=%s  url=%s",
+                opportunity_id, title[:60], score, page_url,
+            )
 
-        await db.execute(
-            update(Document)
-            .where(Document.id == document_id)
-            .values(is_relevant=is_relevant, relevance_confidence=confidence,
-                    processing_status=ProcessingStatus.COMPLETED)
-        )
-        await db.commit()
-
-        await _embed_document(db, document_id, fetched.text)
-        if opportunity_id:
-            await alert_service.emit_opportunity_alerts(db, opportunity_id)
-
-        return {"status": "ok", "relevant": is_relevant, "documents_created": 1,
-                "opportunities_created": opportunities_created, "opportunity_id": opportunity_id,
-                "score": score, "reason": relevance.get("reason", ""), "url": page_url}
-
-    except Exception as exc:  # noqa: BLE001 - one bad page must not abort the crawl
-        await db.rollback()
-        logger.exception("Page processing failed for %s", page_url)
-        if document_id is not None:
-            try:
+        # Step G: Mark document COMPLETED — short write, fresh session.
+        async def _finish_doc() -> None:
+            async with session_context() as db:
                 await db.execute(
-                    update(Document).where(Document.id == document_id).values(processing_status=ProcessingStatus.FAILED)
+                    update(Document)
+                    .where(Document.id == document_id)
+                    .values(is_relevant=is_relevant, relevance_confidence=confidence,
+                            processing_status=ProcessingStatus.COMPLETED)
                 )
                 await db.commit()
+
+        await _db_execute(_finish_doc)
+
+    except Exception as exc:  # noqa: BLE001 - one bad page must not abort the crawl
+        logger.error(  # type: ignore[attr-defined]
+            "❌ [PAGE FAILED] url=%s  error=%s: %s", page_url, type(exc).__name__, exc,
+        )
+        if document_id is not None:
+            try:
+                async def _fail_doc() -> None:
+                    async with session_context() as db:
+                        await db.execute(
+                            update(Document).where(Document.id == document_id)
+                            .values(processing_status=ProcessingStatus.FAILED)
+                        )
+                        await db.commit()
+                await _db_execute(_fail_doc)
             except Exception:  # noqa: BLE001
-                await db.rollback()
+                pass
         return {"status": "failed", "error": str(exc), "documents_created": 0,
                 "opportunities_created": 0, "url": page_url}
+
+    # Step H: Embed document chunks — manages its own sessions internally.
+    await _embed_document(document_id, fetched.text)
+
+    # Step I: Emit opportunity alerts — short write, fresh session.
+    if opportunity_id:
+        try:
+            async def _emit_alerts() -> None:
+                async with session_context() as db:
+                    await alert_service.emit_opportunity_alerts(db, opportunity_id)
+            await _db_execute(_emit_alerts)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Alert emit failed for opp %s: %s", opportunity_id, exc)
+
+    return {"status": "ok", "relevant": is_relevant, "documents_created": 1,
+            "opportunities_created": opportunities_created, "opportunity_id": opportunity_id,
+            "score": score, "reason": relevance.get("reason", ""), "url": page_url}
 
 
 async def _sitemap_candidates(base_url: str) -> list:
@@ -365,26 +498,42 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
     ``CRAWL_MAX_PAGES`` fetch budget. Never raises."""
     source_id = source.id
     source_url = source.url
+    logger.info("🌐 [CRAWL START] source_id=%s  url=%s", source_id, source_url)  # type: ignore[attr-defined]
 
     async def _mark_source(crawl_status: CrawlStatus) -> None:
-        await db.execute(
-            update(Source)
-            .where(Source.id == source_id)
-            .values(
-                last_crawl_at=_now(),
-                last_crawl_status=crawl_status,
-                success_rate=100.0 if crawl_status == CrawlStatus.SUCCESS else 0.0,
-            )
-        )
-        await db.commit()
+        async def _do() -> None:
+            async with session_context() as db:
+                await db.execute(
+                    update(Source)
+                    .where(Source.id == source_id)
+                    .values(
+                        last_crawl_at=_now(),
+                        last_crawl_status=crawl_status,
+                        success_rate=100.0 if crawl_status == CrawlStatus.SUCCESS else 0.0,
+                    )
+                )
+                await db.commit()
+        try:
+            await _db_execute(_do)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to update crawl status for source %s: %s", source_id, exc)
 
     # 1. Fetch the root (best-effort) ---------------------------------------
+    logger.info("🔍 [FETCHING] url=%s", source_url)  # type: ignore[attr-defined]
     try:
         fetched = await fetch_url_content(source_url)
+        logger.info(  # type: ignore[attr-defined]
+            "✅ [FETCHED] url=%s  type=%s  size=%s chars",
+            source_url, fetched.content_type, fetched.content_length,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Crawl fetch failed for source %s (%s): %s", source_id, source_url, exc)
         await _mark_source(CrawlStatus.FAILED)
-        await alert_service.emit_crawl_failure_alert(db, source_url, exc)
+        try:
+            async with session_context() as _alert_db:
+                await alert_service.emit_crawl_failure_alert(_alert_db, source_url, exc)
+        except Exception:  # noqa: BLE001
+            pass
         return {"source_id": str(source_id), "status": "failed", "error": str(exc),
                 "documents_created": 0, "opportunities_created": 0}
 
@@ -396,7 +545,7 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
 
     # 2b. Leaf/detail root (nothing to follow): process the page itself ------
     if not root_links and not root_pagination:
-        result = await _process_page(db, source, fetched)
+        result = await _process_page(source, fetched)
         await _mark_source(CrawlStatus.SUCCESS if result.get("status") != "failed" else CrawlStatus.FAILED)
         result["source_id"] = str(source_id)
         result.setdefault("mode", "single")
@@ -427,25 +576,50 @@ async def ingest_source(db: AsyncSession, source: Source) -> dict[str, Any]:
                 frontier.append(_FrontierItem(page_url, "", depth, process=False))
 
     await _enqueue(root_links, root_pagination, depth=0)
+    logger.info(  # type: ignore[attr-defined]
+        "🔗 [LINKS FOUND] url=%s  count=%s  links=%s",
+        source_url, len(root_links),
+        [c.url for c in root_links[:10]],
+    )
 
     fetches = 0
     while frontier and fetches < settings.CRAWL_MAX_PAGES:
         item = frontier.popleft()
+        logger.info("🔍 [FETCHING] url=%s  depth=%s", item.url, item.depth)  # type: ignore[attr-defined]
         try:
             page = await fetch_url_content(item.url)
+            logger.info(  # type: ignore[attr-defined]
+                "✅ [FETCHED] url=%s  type=%s  size=%s chars",
+                item.url, page.content_type, page.content_length,
+            )
         except Exception as exc:  # noqa: BLE001 - skip a bad link, keep crawling
-            logger.warning("Crawl fetch failed (%s): %s", item.url, exc)
+            exc_str = str(exc).lower()
+            # Downgrade to DEBUG for expected non-errors:
+            # - portal/login/session-gated pages that return no extractable body
+            # - SSL certificate failures on self-signed government portals (e.g. xbrl.bom.mu)
+            # - connection refused / DNS failures on decommissioned links
+            _is_ignorable = (
+                "no text content" in exc_str
+                or "ssl" in exc_str
+                or "certificate" in exc_str
+                or "connection" in exc_str and "refused" in exc_str
+            )
+            (logger.debug if _is_ignorable else logger.warning)(
+                "Crawl fetch failed (%s): %s", item.url, exc
+            )
             continue
         fetches += 1
         if item.process:
-            page_results.append(await _process_page(db, source, page))
+            page_results.append(await _process_page(source, page))
         if item.depth < settings.CRAWL_MAX_DEPTH:
             links, pagination = await _expand_page(source, page, allow_fallbacks=False)
             await _enqueue(links, pagination, depth=item.depth)
 
     logger.info(
-        "Source %s crawl: %s fetched, %s processed, %s candidates (skipped %s irrelevant), depth<=%s",
-        source_id, fetches, len(page_results), total_candidates, skipped_irrelevant, settings.CRAWL_MAX_DEPTH,
+        "🏁 [CRAWL DONE] source_id=%s  pages_fetched=%s  pages_processed=%s  "
+        "candidates=%s  skipped_irrelevant=%s  depth<=%s",
+        source_id, fetches, len(page_results), total_candidates,
+        skipped_irrelevant, settings.CRAWL_MAX_DEPTH,
     )
     await _mark_source(CrawlStatus.SUCCESS)
     return {

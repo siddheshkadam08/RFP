@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -31,10 +32,11 @@ DATABASE_URL = _build_async_database_url(settings.DATABASE_URL)
 engine: AsyncEngine = create_async_engine(
     DATABASE_URL,
     echo=settings.DEBUG,
-    pool_pre_ping=True,
+    pool_pre_ping=True,      # ping before checkout — catches stale connections
     pool_size=10,
     max_overflow=20,
-    pool_recycle=1800,
+    pool_recycle=1800,       # recycle connections after 30 min (before PG idle timeout)
+    pool_timeout=30,         # raise if no free connection within 30 s
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -56,6 +58,25 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
     except Exception:
         logger.exception("Database session failed; rolling back transaction")
+        await session.rollback()
+        raise
+    finally:
+        await session.close()
+
+
+@asynccontextmanager
+async def session_context() -> AsyncGenerator[AsyncSession, None]:
+    """Yield a fresh AsyncSession for use outside FastAPI DI (crawls, Celery tasks).
+
+    Unlike ``get_db`` which is scoped to a single HTTP request, this context manager
+    creates a brand-new session on every call.  The caller holds the connection only
+    for the duration of the ``async with`` block — never across slow I/O (LLM calls,
+    HTTP fetches).  Rollback on exception; always close.
+    """
+    session = AsyncSessionLocal()
+    try:
+        yield session
+    except Exception:
         await session.rollback()
         raise
     finally:

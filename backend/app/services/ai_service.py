@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import httpx
@@ -19,8 +19,17 @@ from app.agents.prompts import (
 )
 from app.core.config import settings
 from app.core.exceptions import AIServiceException
+from app.core.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+def _prompt_preview(messages: list[dict[str, Any]]) -> str:
+    """Return the last user message truncated to 300 chars for logging."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            return str(msg.get("content", ""))[:300]
+    return str(messages[-1].get("content", ""))[:300] if messages else ""
 
 
 def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -75,6 +84,11 @@ async def chat_completion(messages: list[dict[str, Any]], model: str = "small") 
     deployment = _chat_deployment(model)
     normalized_messages = _normalize_messages(messages)
 
+    logger.prompt(  # type: ignore[attr-defined]
+        "🤖 [PROMPT] model=%s  deployment=%s  messages=%s\n    %s",
+        model, deployment, len(normalized_messages), _prompt_preview(normalized_messages),
+    )
+
     payload = {
         "messages": normalized_messages,
         "temperature": 0.2 if model == "small" else 0.4,
@@ -86,7 +100,11 @@ async def chat_completion(messages: list[dict[str, Any]], model: str = "small") 
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
                 response = await client.post(_build_url(deployment, "chat/completions"), headers=_headers(), json=payload)
                 response.raise_for_status()
-                return _extract_chat_text(response.json())
+                result = _extract_chat_text(response.json())
+                logger.prompt(  # type: ignore[attr-defined]
+                    "💬 [LLM RESPONSE] model=%s\n    %s", model, result[:200]
+                )
+                return result
         except (httpx.HTTPError, ValueError, KeyError, AIServiceException) as exc:
             logger.warning("Chat completion attempt %s failed: %s", attempt, exc)
             if attempt == 3:
@@ -140,13 +158,38 @@ async def get_embedding(text: str) -> list[float]:
 
 
 def _extract_json(text: str) -> dict[str, Any]:
+    """Parse the first complete JSON object from an LLM response.
+
+    Handles three common LLM output patterns:
+    1. Clean JSON-only response
+    2. JSON wrapped in a markdown code block (```json ... ``` or ``` ... ```)
+    3. JSON followed by prose / explanatory text — previously caused 'Extra data' error
+    """
+    text = text.strip()
+    # Strip markdown code fences
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+        text = text.rsplit("```", 1)[0].strip()
+    # Fast path: clean JSON
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise
+        pass
+    # Locate the outermost { ... } block using brace counting — ignores trailing prose
+    start = text.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+    depth = 0
+    end = start
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    return json.loads(text[start : end + 1])
 
 
 async def _json_completion(messages: list[dict[str, Any]], model: str = "small") -> dict[str, Any]:
@@ -207,7 +250,13 @@ def _default_score_breakdown(opportunity_data: dict[str, Any]) -> dict[str, int]
             deadline = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
         except ValueError:
             deadline = None
+    # Promote a bare date object (no time) to midnight UTC — generic, not source-specific
+    if isinstance(deadline, date) and not isinstance(deadline, datetime):
+        deadline = datetime(deadline.year, deadline.month, deadline.day, tzinfo=timezone.utc)
+    # Ensure aware datetime before arithmetic — covers naive datetimes from any source or DB row
     if isinstance(deadline, datetime):
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
         days_remaining = (deadline - datetime.now(timezone.utc)).days
         if days_remaining >= 90:
             timeline = 85
@@ -247,16 +296,16 @@ def _weighted_score(breakdown: dict[str, Any]) -> int:
 async def check_relevance(content: str) -> dict[str, Any]:
     """Determine whether content is relevant to SupTech/RegTech opportunities."""
     default = {"relevant": False, "confidence": 0.0, "reason": "AI service unavailable"}
+    logger.prompt("🤖 [PROMPT] name=check_relevance  input_chars=%s\n    %s", len(content), content[:300])  # type: ignore[attr-defined]
     try:
         result = await _json_completion(
             [
-                {
-                    "role": "system",
-                    "content": RELEVANCE_PROMPT.replace("{content}", "").strip(),
-                },
+                {"role": "system", "content": RELEVANCE_PROMPT.replace("{content}", "").strip()},
                 {"role": "user", "content": content},
             ]
         )
+        logger.prompt("💬 [LLM RESPONSE] name=check_relevance  relevant=%s  confidence=%s  reason=%s",  # type: ignore[attr-defined]
+                      result.get("relevant"), result.get("confidence"), str(result.get("reason", ""))[:120])
         return {
             "relevant": bool(result.get("relevant", False)),
             "confidence": float(result.get("confidence", 0.0)),
@@ -282,13 +331,11 @@ async def extract_opportunity(content: str) -> dict[str, Any]:
         "deadline": None,
         "scope": content[:1000],
     }
+    logger.prompt("🤖 [PROMPT] name=extract_opportunity  input_chars=%s\n    %s", len(content), content[:300])  # type: ignore[attr-defined]
     try:
         result = await _json_completion(
             [
-                {
-                    "role": "system",
-                    "content": EXTRACTION_PROMPT.replace("{content}", "").strip(),
-                },
+                {"role": "system", "content": EXTRACTION_PROMPT.replace("{content}", "").strip()},
                 {"role": "user", "content": content},
             ]
         )
@@ -299,6 +346,10 @@ async def extract_opportunity(content: str) -> dict[str, Any]:
             default.update(result)
         if not isinstance(default.get("standards"), list):
             default["standards"] = []
+        logger.prompt(  # type: ignore[attr-defined]
+            "💬 [LLM RESPONSE] name=extract_opportunity  title=%r  institution=%r  deadline=%s",
+            str(default.get("title", ""))[:60], str(default.get("institution", ""))[:60], default.get("deadline"),
+        )
         return default
     except Exception as exc:
         logger.warning("Opportunity extraction fallback used: %s", exc)
@@ -308,29 +359,21 @@ async def extract_opportunity(content: str) -> dict[str, Any]:
 async def classify_opportunity(content: str) -> str:
     """Classify an opportunity into a domain category."""
     valid_categories = {
-        "suptech",
-        "regtech",
-        "analytics",
-        "risk",
-        "taxonomy",
-        "reporting",
-        "deposit_insurance",
-        "data_collection",
-        "workflow",
-        "validation",
+        "suptech", "regtech", "analytics", "risk", "taxonomy", "reporting",
+        "deposit_insurance", "data_collection", "workflow", "validation",
     }
+    logger.prompt("🤖 [PROMPT] name=classify_opportunity  input_chars=%s\n    %s", len(content), content[:300])  # type: ignore[attr-defined]
     try:
         response = await chat_completion(
             [
-                {
-                    "role": "system",
-                    "content": CLASSIFICATION_PROMPT.replace("{content}", "").strip(),
-                },
+                {"role": "system", "content": CLASSIFICATION_PROMPT.replace("{content}", "").strip()},
                 {"role": "user", "content": content},
             ]
         )
         category = response.strip().split()[0].strip('"').lower()
-        return category if category in valid_categories else _heuristic_category(content)
+        result = category if category in valid_categories else _heuristic_category(content)
+        logger.prompt("💬 [LLM RESPONSE] name=classify_opportunity  category=%s", result)  # type: ignore[attr-defined]
+        return result
     except Exception as exc:
         logger.warning("Opportunity classification fallback used: %s", exc)
         return _heuristic_category(content)
@@ -340,13 +383,13 @@ async def score_opportunity(opportunity_data: dict[str, Any]) -> dict[str, Any]:
     """Score an opportunity using weighted criteria."""
     fallback_breakdown = _default_score_breakdown(opportunity_data)
     fallback = {"score": _weighted_score(fallback_breakdown), "breakdown": fallback_breakdown}
+    logger.prompt(  # type: ignore[attr-defined]
+        "🤖 [PROMPT] name=score_opportunity  title=%r", str(opportunity_data.get("title", ""))[:60]
+    )
     try:
         result = await _json_completion(
             [
-                {
-                    "role": "system",
-                    "content": SCORING_PROMPT.replace("{opportunity_data}", "").strip(),
-                },
+                {"role": "system", "content": SCORING_PROMPT.replace("{opportunity_data}", "").strip()},
                 {"role": "user", "content": json.dumps(opportunity_data, default=str)},
             ]
         )
@@ -358,7 +401,9 @@ async def score_opportunity(opportunity_data: dict[str, Any]) -> dict[str, Any]:
             "technology": int(float(breakdown.get("technology", fallback_breakdown["technology"]))),
             "competition": int(float(breakdown.get("competition", fallback_breakdown["competition"]))),
         }
-        return {"score": _weighted_score(normalized), "breakdown": normalized}
+        score = _weighted_score(normalized)
+        logger.prompt("💬 [LLM RESPONSE] name=score_opportunity  score=%s  breakdown=%s", score, normalized)  # type: ignore[attr-defined]
+        return {"score": score, "breakdown": normalized}
     except Exception as exc:
         logger.warning("Opportunity scoring fallback used: %s", exc)
         return fallback
@@ -384,6 +429,7 @@ async def filter_relevant_titles(titles: list[str]) -> list[bool]:
     if not titles:
         return []
     numbered = "\n".join(f"{index}. {title}" for index, title in enumerate(titles))
+    logger.prompt("🤖 [PROMPT] name=filter_relevant_titles  count=%s\n    %s", len(titles), numbered[:300])  # type: ignore[attr-defined]
     try:
         result = await _json_completion(
             [
@@ -398,6 +444,8 @@ async def filter_relevant_titles(titles: list[str]) -> list[bool]:
                 keep.add(int(value))
             except (TypeError, ValueError):
                 continue
+        kept_titles = [titles[i] for i in sorted(keep) if i < len(titles)]
+        logger.prompt("💬 [LLM RESPONSE] name=filter_relevant_titles  kept=%s/%s  titles=%s", len(keep), len(titles), kept_titles[:5])  # type: ignore[attr-defined]
         return [index in keep for index in range(len(titles))]
     except Exception as exc:  # noqa: BLE001 - keyword fallback
         logger.warning("Title relevance gate fell back to keywords: %s", exc)
@@ -462,13 +510,16 @@ async def copilot_chat(
 
 async def summarize_document(content: str) -> str:
     """Summarize a document using the configured AI provider."""
+    logger.prompt("🤖 [PROMPT] name=summarize_document  input_chars=%s\n    %s", len(content), content[:300])  # type: ignore[attr-defined]
     try:
-        return await chat_completion(
+        result = await chat_completion(
             [
                 {"role": "system", "content": SUMMARIZE_PROMPT.replace("{content}", "").strip()},
                 {"role": "user", "content": content},
             ]
         )
+        logger.prompt("💬 [LLM RESPONSE] name=summarize_document\n    %s", result[:200])  # type: ignore[attr-defined]
+        return result
     except Exception as exc:
         logger.warning("Document summarization fallback used: %s", exc)
         clean_content = " ".join(content.split())

@@ -107,10 +107,7 @@ async def keyword_search(payload: KeywordSearchRequest, current_user: CurrentUse
         service = _get_service()
         page, page_size = _page_args(payload)
         filters = _search_filters(payload)
-        try:
-            result = await service.keyword_search(db=db, search_request=payload, user_id=current_user.sub)
-        except TypeError:
-            result = await service.keyword_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
+        result = await service.keyword_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
         return _paginated_response(result, page, page_size)
     except AppException:
         raise
@@ -128,10 +125,7 @@ async def semantic_search(payload: SemanticSearchRequest, current_user: CurrentU
         service = _get_service()
         page, page_size = _page_args(payload)
         filters = _search_filters(payload)
-        try:
-            result = await service.semantic_search(db=db, search_request=payload, user_id=current_user.sub)
-        except TypeError:
-            result = await service.semantic_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
+        result = await service.semantic_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
         return _paginated_response(result, page, page_size)
     except AppException:
         raise
@@ -149,10 +143,7 @@ async def hybrid_search(payload: HybridSearchRequest, current_user: CurrentUser,
         service = _get_service()
         page, page_size = _page_args(payload)
         filters = _search_filters(payload)
-        try:
-            result = await service.hybrid_search(db=db, search_request=payload, user_id=current_user.sub)
-        except TypeError:
-            result = await service.hybrid_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
+        result = await service.hybrid_search(db=db, query=payload.query, page=page, page_size=page_size, filters=filters)
         return _paginated_response(result, page, page_size)
     except AppException:
         raise
